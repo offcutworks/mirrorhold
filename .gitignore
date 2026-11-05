@@ -1,0 +1,31 @@
+# This file is complete on its own: the project is published as a repository of its
+# own, where no enclosing .gitignore exists.
+
+# Every runtime file that carries the user's paths: the configuration store, its
+# previous copies, run records, live status, locks, tickets and verification records
+# (mirrorhold/locations.py), and the logs a failed start leaves.
+/Config/
+*.log
+
+# Python bytecode, and the environment README.md creates in this folder.
+__pycache__/
+*.py[cod]
+/.venv/
+
+# The pinned rclone copy. It is obtained per machine from the official release by
+# tools/fetch_engine.py, which checks it against the pinned checksums, and is never
+# committed: a binary in history cannot be audited by its diff.
+/vendor/
+
+# What a release is built from — the interpreter, Tk and pywin32 that
+# tools/fetch_build_inputs.py obtains and checks against their pinned checksums — and
+# what tools/build_release.py writes: each release's zip, SHA256SUMS and suite
+# transcript. Made per machine, never committed.
+/build-inputs/
+/dist/
+
+# The installed copy that scheduled tasks and the Start menu entry run, and the folders
+# an install or uninstall builds or sets aside beside it. A copy of tracked code and of
+# the engine above, made per machine by `python -m mirrorhold install`.
+/installed/
+/installed.*/

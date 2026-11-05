@@ -1,0 +1,3 @@
+# MirrorHold runs on Python 3.14 or later for Windows, with Tk (the python.org
+# installer includes it). The one package beyond the standard library:
+pywin32>=312
