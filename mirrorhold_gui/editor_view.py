@@ -12,9 +12,9 @@ drive, disabled for a drive that cannot be snapshotted, which a line under it th
 The engine is asked about a job's remote destinations as they are added or the job opens,
 on a thread: *Save* waits for its answer, and the checks then say what it found.
 *When to run* says first that the job runs when the user starts it, and offers the
-automatic runs as additions, each off for a new job; the switch pausing them is enabled
-only while one is chosen, and a line says so only when automatic runs would not take
-effect. A schedule takes its days — daily, chosen weekdays or a day of the month — and its
+automatic runs as additions, each off for a new job, and a line says so only when
+automatic runs would not take effect; each destination's switch is the job list's. A
+schedule takes its days — daily, chosen weekdays or a day of the month — and its
 times — one or more listed, or every few hours, between two times or not — and a control
 the choices made do not use is disabled, its value kept, rather than hidden. *Holding removals* takes the count floor, the percentage and the share hold,
 whose entry is disabled, its value kept, while the hold is switched off.
@@ -321,11 +321,6 @@ class EditorWindow:
         Hint(self.month_day_box, "The 29th to the 31st are not offered, since some months lack them; "
                                  "the last day serves the end of every month.")
         self._build_times(box, indent)
-        self.paused = tk.BooleanVar(value=d.paused)
-        self.pause_button = ttk.Checkbutton(box, variable=self.paused, command=self._changed,
-                                            text="Pause automatic runs")
-        self.pause_button.grid(row=7, column=0, columnspan=2, sticky="w", padx=(indent, 0), pady=(PAD // 2, 0))
-        Hint(self.pause_button, "The choices above are kept.")
         words = automation_words(self.session.installation())
         if words:
             ttk.Label(box, text=words, wraplength=em(outer, 26), justify="left").grid(row=8, column=0, columnspan=2,
@@ -425,7 +420,6 @@ class EditorWindow:
         set_enabled(self.window_button, scheduled and repeating)
         for entry in (self.window_start_entry, self.window_end_entry):
             set_enabled(entry, scheduled and repeating and self.window_on.get())
-        set_enabled(self.pause_button, self.on_arrival.get() or scheduled)
 
     # --- the draft -----------------------------------------------------------------------
 
@@ -456,7 +450,6 @@ class EditorWindow:
         d.window_on = self.window_on.get()
         d.window_start_text = self.window_start.get()
         d.window_end_text = self.window_end.get()
-        d.paused = self.paused.get()
         d.cleanup = self.cleanup.get()
         d.keep_days_text = self.keep_days.get()
         d.reminder_days_text = self.reminder_days.get()

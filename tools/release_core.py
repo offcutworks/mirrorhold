@@ -27,8 +27,9 @@ commit, never from a working tree, and downloads nothing. In order, it:
   name the account;
 - runs the tool's whole suite under the assembled interpreter on the commit's tree, and
   refuses the release unless the tool's reading of the transcript against its ledger
-  finds the failing tests exactly those the ledger records (``run_suite``; a build told
-  not to run it says the build is not verified);
+  finds the failing tests exactly those the ledger records as red, a test it marks as red
+  only sometimes accepted whether it fails or passes (``run_suite``, ``verdict``; a build
+  told not to run it says the build is not verified);
 - writes ``<out>/<label>/<Name>-<label>.zip``, the release's files at its top level, its
   entries in one order with the first day of the label's month as every file's time;
 - runs the tool's steps after the zip, each of which may write further assets beside it
@@ -535,6 +536,24 @@ def files_naming(folder: Path, paths: Iterable[str]) -> List[str]:
 SUITE_TIMEOUT = 3600
 _FAILURE = re.compile(r"^(FAIL|ERROR): (\S+) \(([^)\s]+)\)")
 
+# The mark a ledger entry carries when its tests are red only sometimes: its delta field opens
+# with these exact characters. Every tool's ledger reader asks ``marked_flaky`` of an entry's
+# delta, so one spelling holds for every ledger a build reads.
+FLAKY_MARK = "flaky-quarantine."
+
+
+def marked_flaky(delta: str) -> bool:
+    """Whether a ledger entry's delta field carries ``FLAKY_MARK``. A delta that opens with
+    "flaky" in any other spelling — another case, a space for the hyphen, the mark set in
+    backticks or emphasis as a ledger's header quotes it — raises BuildError rather than
+    reading as an entry whose tests must be red: the writer meant the mark."""
+    text = delta.strip()
+    if text.startswith(FLAKY_MARK):
+        return True
+    if text.lstrip("`*_( ")[:5].casefold() == "flaky":
+        raise BuildError(f"a ledger entry's delta opens {text[:24]!r}, which is not the mark {FLAKY_MARK!r}")
+    return False
+
 
 def failed_tests(output: str) -> Set[str]:
     """The tests a unittest transcript reports failed or in error, as module.Class.test
@@ -554,20 +573,29 @@ class SuiteResult:
     summary: str                          # the suite's own count line
     failed: Tuple[str, ...]
     unexpected: Tuple[str, ...]           # red and not in the ledger
-    recovered: Tuple[str, ...]            # in the ledger and no longer red
+    recovered: Tuple[str, ...]            # in the ledger as red and no longer red
+    flaky: Tuple[str, ...] = ()           # in the ledger as red only sometimes, and red in this run
 
     @property
     def matches_ledger(self) -> bool:
         return not self.unexpected and not self.recovered
 
 
-def verdict(summary: str, failed: Iterable[str], expected: Iterable[str]) -> SuiteResult:
-    """The suite's result against the reds its ledger records: a release needs the failing
-    tests to be exactly those, so a red the ledger does not hold and a ledgered test that
-    passes each refuse it."""
-    failed, expected = set(failed), set(expected)
-    return SuiteResult(summary, tuple(sorted(failed)), tuple(sorted(failed - expected)),
-                       tuple(sorted(expected - failed)))
+def verdict(summary: str, failed: Iterable[str], expected: Iterable[str], *,
+            flaky: Iterable[str] = ()) -> SuiteResult:
+    """The suite's result against its ledger: a release needs the failing tests to be exactly
+    those the ledger records as red (``expected``), so a red the ledger does not hold and a
+    ledgered red that passes each refuse it. A test the ledger marks as red only sometimes
+    (``flaky``) refuses nothing whether it fails or passes: its fix is a change of its own,
+    and a build that waited for it to pass would be re-running it until it did. Its reds are
+    still reported. A test the ledger records both ways is a contradiction, and refuses the
+    build here, before anything is judged."""
+    failed, expected, flaky = set(failed), set(expected), set(flaky)
+    both = expected & flaky
+    if both:
+        raise BuildError(f"the ledger records {sorted(both)} both as red and as red only sometimes")
+    return SuiteResult(summary, tuple(sorted(failed)), tuple(sorted(failed - expected - flaky)),
+                       tuple(sorted(expected - failed)), tuple(sorted(failed & flaky)))
 
 
 def _nothing(*_) -> None:
@@ -604,7 +632,8 @@ def run_suite(source: Path, runtime: Path, suite: Suite, transcript: Path, *,
     result = suite.judge(transcript.read_text(encoding="utf-8", errors="replace"),
                          (source / suite.ledger).read_text(encoding="utf-8"))
     say(f"Suite: {result.summary} in {time.monotonic() - started:.0f} s; "
-        f"{'the failures are exactly the ledger' if result.matches_ledger else 'the failures differ from the ledger'}")
+        f"{'the failures are exactly the ledger' if result.matches_ledger else 'the failures differ from the ledger'}"
+        + (f"; red only sometimes, and red in this run: {list(result.flaky)}" if result.flaky else ""))
     return result
 
 
@@ -755,7 +784,7 @@ def build(project: Path, tool: Tool, *, label: str, commit: str = "HEAD", inputs
             if not suite_result.matches_ledger:
                 raise BuildError("the suite's failures differ from the ledger: "
                                  f"red and not in the ledger {list(suite_result.unexpected)}, "
-                                 f"in the ledger and passing {list(suite_result.recovered)}; "
+                                 f"in the ledger as red and passing {list(suite_result.recovered)}; "
                                  f"see {transcript}")
         else:
             note = f"{tool.suite.skipped}: this build is not verified"

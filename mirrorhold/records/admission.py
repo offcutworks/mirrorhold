@@ -2,7 +2,8 @@
 
 Runs, full verifications and repairs — activities — work at the same time unless they
 conflict. Each claims, before it starts, the folders it reads and the folders it writes:
-a run reads its source and writes each selected destination present when it is admitted;
+a run reads its source and writes each selected destination present when it is first
+admitted that it has not finished (*A run's destinations one at a time*, below);
 a verification reads its source and its destination and writes nothing; a repair
 (``maintenance.repairer``) claims as a run of its one destination does. Two activities
 conflict when a folder one writes and a folder the other reads or writes lie on one
@@ -14,10 +15,13 @@ activity whose claim cannot be read — one started by an older copy of the tool
 publishes none — conflicts with every other. One of this copy that has published its
 first status but not yet made its first attempt, and so claims nothing, has asked for
 nothing and holds no one back (``before_first_attempt``): the activities a group or
-several items start at once would otherwise each wait one attempt for the others.
+several items start at once would otherwise each wait one attempt for the others. Nor does
+a run that stopped waiting without a turn — cancelled, or no longer to run by itself — and
+withdrew its claim as it ends.
 
 **Turns on a drive.** A claim also names the drives its present folders lie on
-(``VolumeInfo.drive``: a physical disk, or a volume no single disk carries), each with
+(``VolumeInfo.drive``: a physical disk, or a volume no single disk carries; a run's, those
+of its source and of the destination it works on alone, below), each with
 the words a person knows it by and its kind — what the user says the drive is
 (``Activities.drive_kinds``, read from the job file with the choice), else what its disk
 reports (``VolumeInfo.drive_kind``), decided here alone (``_drives``) — and the user's
@@ -41,28 +45,68 @@ remote and folder like any other (``RemoteEndpoint.overlaps``). Beyond that, any
 activities that both reach a remote take turns, whatever the choice for drives: every
 remote is reached through one rclone configuration, which the engine rewrites when it
 refreshes a service's sign-in, and two engines refreshing one configuration at once could
-lose a fresh sign-in where the service lets each be used only once. A waiting activity names
-that configuration where a drive would stand (``CONFIGURATION``), when it alone is why. An
-older copy reads a claim naming a remote's folder as one it cannot read, and so waits for it.
+lose a fresh sign-in where the service lets each be used only once. A claim says whether
+it reaches a remote now (``Claim.remote``): a run names the remote folders of the
+destinations it has yet to reach, but reaches a remote only while it works on one of them.
+A claim that does not say — an older copy's — reaches one whenever it names a remote's
+folder, and an older copy that knows remote folders reads every claim so: it takes turns on
+the remotes with a run for as long as that run has a remote destination left. A copy older
+still reads a claim naming a remote's folder as one it cannot read, and so waits for it. A
+waiting activity names that configuration where a drive would stand (``CONFIGURATION``),
+when it alone is why.
 
 An activity publishes its claim in its live status (``records.status``) from its first
 attempt, and starts when, under the admission lock (``RuntimeLayout.admission_lock``,
 held for the moment a decision takes), no admitted activity conflicts with it and no
-waiting activity it conflicts with goes first: a waiting run or repair goes before any
-verification, and otherwise the one queued first goes first.
-Admitted, it holds everything it claimed until it ends, a pause included, so no two
-activities each hold part of what the other needs, and the strict order means none
-waits for ever behind a later one. The decision is published before the lock is
+waiting activity it conflicts with goes first: a run waiting between two of its
+destinations goes before every activity that has not begun (below), then a waiting run or
+repair before any verification, and otherwise the one queued first goes first — the user
+may move a waiting run or repair to the front (``records.status.run_next``), which changes
+when it counts as queued and nothing else. Admitted, it holds what it claimed until it
+ends, or a run until it is done with the destination it works on; one that waits holds
+nothing — one taking its drives back after a pause aside (below) — and the strict order
+means none waits for ever behind a later one. The decision is published before the lock is
 released, so the next decision sees it, and every dead activity is reaped in the same
 moment, so none is recorded twice. A waiting activity publishes the one it waits for —
 naming the drive they share when the drive alone is why — and its place in line: one
-more than the waiting activities it conflicts with that go first. One it waits for whose
-status it cannot read now it names by the last status its attempts read of it, saying
-that it cannot read it now.
+more than the waiting activities it conflicts with that go first, a run that has begun
+counted only in the place of another that has, since none that has not can pass it. One
+it waits for whose status it cannot read now it names by the last status its attempts read
+of it, saying that it cannot read it now.
+
+**A run's destinations one at a time** (the maintainer's decision of 2026-11-10). A run
+holds a destination's drive only while it works on that destination. Its claim names the
+folders of every destination it has not finished, so that nothing else writes there or
+reads there before it has, but the drives of its source and of the one destination it
+works on alone, so what shares only another of its drives works beside it; and it reaches
+the remotes only while that destination is a remote's folder (``run_claim``'s ``working``).
+Done there, it gives up everything and asks again in the same moment, under the lock: it
+is admitted on the first of the destinations it has not finished, by number, that nothing
+holds back, a held one left for later (``admit``'s ``any_of``), and otherwise waits,
+claiming them all as one waiting for its first turn does. A run waiting so has begun
+(``Activity.begun``): its source is listed, and another writer on a destination it has yet
+to reach — another run of its job, a repair there — would leave it writing there from an
+older listing. So it goes before every activity that has not begun, wherever their places
+in line, as one taking its drives back after a pause does (below). None waits longer for
+it than it would behind a run holding all of its claim to its end, and the order is
+still strict — begun first, then runs and repairs before verifications, then the one
+queued first — so it adds no way to wait for ever.
+
+**A pause frees the drives** (the maintainer's decision of 2026-11-07). A paused activity
+uses no drive, so nothing takes turns with it: those that share only a drive with it go
+ahead (``Activity.holds_drives``). It keeps its folders, and its turn on the remotes: the plan
+it holds would not survive another writer there, and its engine, suspended, still holds a
+sign-in. Asked to work again it takes its drives back (``take_back``): it may once nothing
+at work uses a drive it takes turns on, and until then it stays paused, says whom it waits
+for (``resuming``) and holds its drives against everyone not yet admitted, so it keeps its
+place ahead of them. It waits only for activities at work, and those wait for nothing it
+holds, so this adds no way to wait for ever: of two asked to work again at one instant,
+the lock lets one go first, and the other then finds it at work.
 
 A working verification gives way to a waiting run or repair it conflicts with that
 nothing but verifications holds back (``gives_way``), judged as that one judges its own
-turn: writing the backup first, and only to the activities it actually blocks.
+turn: writing the backup first, and only to the activities it actually blocks. A run or a
+repair taking its drives back counts as waiting here.
 """
 from __future__ import annotations
 
@@ -73,7 +117,7 @@ from ..contract_errors import ContractError
 from ..endpoints.endpoint import AnyEndpoint, RemoteEndpoint, endpoint_from_document
 from ..endpoints.resolution import Presence, resolve
 from ..endpoints.volumes import DriveKind, VolumeInfo, drive_name
-from ..jobs.model import Activities, DriveMark, DriveTurns, Job
+from ..jobs.model import Activities, Destination, DriveMark, DriveTurns, Job
 from ..locations import RuntimeLayout
 from .lock import holding
 from .status import (KIND_RUN, KIND_VERIFICATION, LastRead, LiveStatus, ObservedRun, Phase, StatusBoard, observe_runs,
@@ -117,13 +161,15 @@ class ClaimedDrive:
 
 @dataclass(frozen=True)
 class Claim:
-    """The folders an activity reads and the folders it writes, the drives they lie on, and
-    when it takes turns on a drive."""
+    """The folders an activity reads and the folders it writes, the drives they lie on,
+    when it takes turns on a drive, and whether it reaches a remote now: None where the
+    claim does not say (an older copy's), when it does whenever it names a remote's folder."""
 
     reads: Tuple[AnyEndpoint, ...] = ()
     writes: Tuple[AnyEndpoint, ...] = ()
     drives: Tuple[ClaimedDrive, ...] = ()
     turns: DriveTurns = DriveTurns.AT_THE_SAME_TIME
+    remote: Optional[bool] = None
 
     def __post_init__(self):
         if not isinstance(self.turns, DriveTurns):
@@ -131,7 +177,9 @@ class Claim:
 
     @property
     def reaches_remote(self) -> bool:
-        """Whether the activity reaches a remote, through the one rclone configuration."""
+        """Whether the activity reaches a remote now, through the one rclone configuration."""
+        if self.remote is not None:
+            return self.remote
         return any(isinstance(e, RemoteEndpoint) for e in self.reads + self.writes)
 
     def takes_turns_on(self, drive: ClaimedDrive) -> bool:
@@ -144,15 +192,20 @@ class Claim:
 
     def to_document(self) -> dict:
         # "one_per_drive" is what an older copy reads: one choice for all of a claim's drives.
-        return {"reads": [e.to_document() for e in self.reads], "writes": [e.to_document() for e in self.writes],
-                "drives": [d.to_document() for d in self.drives], "turns": self.turns.value,
-                "one_per_drive": any(self.takes_turns_on(d) for d in self.drives)}
+        doc = {"reads": [e.to_document() for e in self.reads], "writes": [e.to_document() for e in self.writes],
+               "drives": [d.to_document() for d in self.drives], "turns": self.turns.value,
+               "one_per_drive": any(self.takes_turns_on(d) for d in self.drives)}
+        if self.remote is not None:
+            doc["remote"] = self.remote
+        return doc
 
     @classmethod
     def from_document(cls, doc: Any) -> Optional["Claim"]:
         """The claim a status publishes; None when it holds none that can be read. One that
         names no drives (an older copy's) names none; one that names no turns (an older
-        copy's too) takes turns on all its drives or on none, as its one choice says."""
+        copy's too) takes turns on all its drives or on none, as its one choice says; one
+        that does not say whether it reaches a remote now (an older copy's too) does whenever
+        it names a remote's folder."""
         try:
             reads = tuple(endpoint_from_document(e) for e in doc["reads"])
             writes = tuple(endpoint_from_document(e) for e in doc["writes"])
@@ -165,7 +218,10 @@ class Claim:
                          if isinstance(one_per_drive, bool) else None)
             if turns is None:
                 return None
-            return cls(reads, writes, drives, turns)
+            remote = doc.get("remote")
+            if remote is not None and not isinstance(remote, bool):
+                return None
+            return cls(reads, writes, drives, turns, remote)
         except (ContractError, KeyError, TypeError, AttributeError):
             return None
 
@@ -191,15 +247,35 @@ def _drives(endpoints: Sequence[AnyEndpoint], volumes: Sequence[VolumeInfo],
     return tuple(found.values())
 
 
+def worked_on(destination: Destination, volumes: Sequence[VolumeInfo]) -> bool:
+    """Whether a run claims ``destination`` and works on it at a turn of its own: a remote's
+    folder, whose presence only the engine can tell, or a drive's present among ``volumes``.
+    Any other is recorded as it stands, needing no turn (``run.runner``)."""
+    return destination.remote is not None or resolve(destination.endpoint, volumes).presence is Presence.PRESENT
+
+
+def _written(job: Job, indexes: Sequence[int], volumes: Sequence[VolumeInfo]) -> Tuple[AnyEndpoint, ...]:
+    """The folders of the destinations ``indexes`` (1-based) a run writes (``worked_on``)."""
+    return tuple(job.destinations[i - 1].endpoint for i in indexes if worked_on(job.destinations[i - 1], volumes))
+
+
 def run_claim(job: Job, indexes: Sequence[int], volumes: Sequence[VolumeInfo], *,
-              turns: DriveTurns = DriveTurns.AT_THE_SAME_TIME, marks: Sequence[DriveMark] = ()) -> Claim:
+              turns: DriveTurns = DriveTurns.AT_THE_SAME_TIME, marks: Sequence[DriveMark] = (),
+              working: Optional[int] = None) -> Claim:
     """A run's claim: its source read, each selected destination (1-based) present among
     ``volumes`` — or a remote's folder, whose presence only the engine can tell — written,
-    and the drives of those present, of the kinds ``marks`` says."""
-    writes = tuple(job.destinations[i - 1].endpoint for i in indexes
-                   if job.destinations[i - 1].remote is not None
-                   or resolve(job.destinations[i - 1].endpoint, volumes).presence is Presence.PRESENT)
-    return Claim((job.source.endpoint,), writes, _drives((job.source.endpoint,) + writes, volumes, marks), turns)
+    and the drives of those present, of the kinds ``marks`` says. With ``working``, one of
+    ``indexes``, the claim of a run working on that destination: the same folders, but the
+    drives of its source and of that destination alone, and reaching a remote only when that
+    destination is a remote's folder."""
+    source = job.source.endpoint
+    writes = _written(job, indexes, volumes)
+    if working is None:
+        return Claim((source,), writes, _drives((source,) + writes, volumes, marks), turns)
+    if working not in indexes:
+        raise ValueError(f"destination {working} is not among those claimed")
+    return Claim((source,), writes, _drives((source,) + _written(job, (working,), volumes), volumes, marks), turns,
+                 job.destinations[working - 1].remote is not None)
 
 
 def verification_claim(job: Job, index: int, volumes: Sequence[VolumeInfo] = (), *,
@@ -211,14 +287,16 @@ def verification_claim(job: Job, index: int, volumes: Sequence[VolumeInfo] = (),
 
 
 def activity_claim(job: Job, indexes: Sequence[int], volumes: Sequence[VolumeInfo], activities: Activities, *,
-                   verifying: bool = False) -> Claim:
+                   verifying: bool = False, working: Optional[int] = None) -> Claim:
     """The claim of an activity of ``job`` under the job file's ``activities``: a run (or a
-    repair) of the destinations ``indexes``, or with ``verifying`` a verification of its one
-    destination — so every activity reads the choice and the drives' marks the same way."""
+    repair) of the destinations ``indexes`` — working on ``working`` among them, when given
+    (``run_claim``) — or with ``verifying`` a verification of its one destination — so every
+    activity reads the choice and the drives' marks the same way."""
     if verifying:
         (index,) = indexes
         return verification_claim(job, index, volumes, turns=activities.drive_turns, marks=activities.drive_kinds)
-    return run_claim(job, indexes, volumes, turns=activities.drive_turns, marks=activities.drive_kinds)
+    return run_claim(job, indexes, volumes, turns=activities.drive_turns, marks=activities.drive_kinds,
+                     working=working)
 
 
 @dataclass(frozen=True)
@@ -275,6 +353,8 @@ class Activity:
     claim: Optional[Claim]
     readable: bool = True            # False: its status cannot be read now
     last_kind: str = ""              # one not readable: its kind in the last status read of it, "" for none
+    resuming: bool = False           # paused, asked to work again, its drives not back yet
+    begun: bool = False              # a run that has finished a destination: its source is listed
 
     @classmethod
     def from_observed(cls, observed: ObservedRun) -> "Activity":
@@ -291,24 +371,41 @@ class Activity:
 
     @classmethod
     def from_status(cls, doc: Mapping[str, Any]) -> "Activity":
+        """An activity as its status says. A run has begun once it names a destination it has
+        finished: a run records its destinations only once admitted, so one that waits naming
+        one waits between two of them — which a run of an older copy never does."""
         admitted = doc.get("admitted")
         if not isinstance(admitted, bool):        # an older copy of the tool: working unless waiting
             admitted = doc.get("phase") != Phase.WAITING.value
         claim = doc.get("claim")
-        return cls(str(doc.get("run_id") or ""), str(doc.get("kind") or KIND_RUN), str(doc.get("job_id") or ""),
+        kind = str(doc.get("kind") or KIND_RUN)
+        finished = doc.get("finished")
+        return cls(str(doc.get("run_id") or ""), kind, str(doc.get("job_id") or ""),
                    str(doc.get("job_name") or ""), str(doc.get("marker_id") or ""),
                    str(doc.get("queued") or doc.get("started") or ""), admitted, bool(doc.get("paused")),
-                   Claim.from_document(claim) if claim is not None else None)
+                   Claim.from_document(claim) if claim is not None else None, resuming=bool(doc.get("resuming")),
+                   begun=kind == KIND_RUN and isinstance(finished, list) and bool(finished))
 
     @property
     def order(self) -> Tuple[str, str]:
         """Its place in line: when it was queued, the identifier breaking a tie."""
         return self.queued, self.run_id
 
+    @property
+    def at_work(self) -> bool:
+        return self.admitted and not self.paused
+
+    @property
+    def holds_drives(self) -> bool:
+        """Whether the drives it takes turns on are its own now: admitted, and not paused
+        unless it has asked for them back."""
+        return self.at_work or (self.admitted and self.resuming)
+
     def waited_for(self, drive: str = "") -> WaitedFor:
         if not self.readable:
             return WaitedFor(self.run_id, self.last_kind, self.job_name, readable=False)
-        return WaitedFor(self.run_id, self.kind, self.job_name, self.paused, not self.admitted, drive)
+        return WaitedFor(self.run_id, self.kind, self.job_name, self.paused and not self.resuming,
+                         not self.admitted or self.resuming, drive)
 
 
 def _touches(writes: Sequence[AnyEndpoint], claim: Claim) -> bool:
@@ -340,7 +437,11 @@ def _one_work(a: Activity, b: Activity) -> bool:
 
 def goes_first(waiting: Activity, other: Activity) -> bool:
     """Whether ``waiting`` goes before ``other`` when the two conflict and both wait: a run
-    or a repair before any verification; otherwise the one queued first."""
+    that has begun before any activity that has not; then a run or a repair before any
+    verification; otherwise the one queued first. One order for every pair, so no two
+    waiting activities each wait for the other."""
+    if waiting.begun != other.begun:
+        return waiting.begun
     if (waiting.kind == KIND_VERIFICATION) != (other.kind == KIND_VERIFICATION):
         return other.kind == KIND_VERIFICATION
     return waiting.order < other.order
@@ -355,15 +456,21 @@ def _ahead(me: Activity, others: Sequence[Activity]) -> List[Activity]:
 def blockers(me: Activity, others: Sequence[Activity]) -> List[Activity]:
     """What keeps ``me`` waiting, the first named first: every admitted activity it
     conflicts with, then every waiting one it conflicts with that goes first — a drive
-    both use counting when ``me`` takes turns on it."""
-    held = sorted((o for o in others if o.admitted and conflict(me, o, by_drive=True)), key=lambda o: o.order)
+    both use counting when ``me`` takes turns on it and the other holds its drives. One
+    taking its drives back holds its place already, and waits only for what works on them."""
+    if me.resuming:
+        return sorted((o for o in others if o.at_work and conflict(me, o, by_drive=True)), key=lambda o: o.order)
+    held = sorted((o for o in others if o.admitted and conflict(me, o, by_drive=o.holds_drives)),
+                  key=lambda o: o.order)
     return held + _ahead(me, others)
 
 
 def place_in_line(me: Activity, others: Sequence[Activity]) -> int:
     """Where ``me`` stands while it waits: 1 when no waiting activity it conflicts with goes
-    first, one more for each that does."""
-    return len(_ahead(me, others)) + 1
+    first, one more for each that does — a run that has begun counted only in the place of
+    another that has: none that has not can pass it, so it stands as one at work does, and
+    a run moved to the front is first among those that can."""
+    return len([o for o in _ahead(me, others) if o.begun == me.begun]) + 1
 
 
 def _shared_drive(me: Activity, other: Activity) -> str:
@@ -378,9 +485,10 @@ def _shared_drive(me: Activity, other: Activity) -> str:
 
 
 def before_first_attempt(status: Mapping[str, Any]) -> bool:
-    """Whether a status is an activity of this copy that has not asked for its turn yet: it
-    says it holds no turn — which an older copy's status never says — and claims nothing.
-    Its first status is published before its first attempt, which publishes its claim."""
+    """Whether a status is an activity of this copy that asks for no turn: it says it holds
+    no turn — which an older copy's status never says — and claims nothing. Its first status
+    is published before its first attempt, which publishes its claim; a run that stops
+    waiting without a turn withdraws its claim as it ends (``run.runner``)."""
     return status.get("admitted") is False and status.get("claim") is None
 
 
@@ -410,40 +518,85 @@ class Turn:
 
     admitted: bool
     waits_for: Optional[Activity] = None
+    chosen: int = 0                       # admitted: which of ``admit``'s ``any_of``, when given
 
 
-def admit(board: StatusBoard, claim: Claim) -> Turn:
-    """One attempt at the activity's turn, under the admission lock. Its claim is published;
-    when nothing holds it back it is admitted — published before the lock is released, or
-    not admitted at all — and every dead activity is reaped; otherwise what it waits for,
-    the drive they share when that alone is why, and its place in line are published with
-    its claim."""
+def admit(board: StatusBoard, claim: Claim, *, any_of: Sequence[Claim] = ()) -> Turn:
+    """One attempt at the activity's turn, under the admission lock. When nothing holds its
+    claim back it is admitted with it; with ``any_of`` — parts of ``claim``, a run's claims
+    each working on one of its destinations, in the order they are to be tried — it is
+    admitted with the first of them nothing holds back instead. Admitted, the claim it holds
+    is published before the lock is released, or it is not admitted at all, and every dead
+    activity is reaped; otherwise ``claim`` is published with what it waits for, the drive
+    they share when that alone is why, and its place in line. An activity admitted before
+    — a run between two of its destinations — holds nothing from the moment it asks."""
     layout, status = board.layout, board.status
     with holding(layout.admission_lock):
-        status.claim = claim.to_document()
+        others: Optional[List[Activity]] = None
+        for position, offered in enumerate(any_of or (claim,)):
+            status.claim = offered.to_document()
+            me = Activity.from_status(status.to_document())
+            if others is None:
+                others = [a for a in live_activities(layout, board.last_read) if a.run_id != me.run_id]
+            if blockers(me, others):
+                continue
+            status.admitted, status.waiting_for, status.place = True, None, 0
+            try:
+                board.publish(patience=PUBLISH_PATIENCE)
+            except OSError:
+                status.admitted, status.claim = False, claim.to_document()
+                return Turn(False)
+            reap_interrupted(layout)
+            return Turn(True, chosen=position)
+        status.admitted, status.claim = False, claim.to_document()
         me = Activity.from_status(status.to_document())
-        others = [a for a in live_activities(layout, board.last_read) if a.run_id != me.run_id]
         found = blockers(me, others)
+        status.waiting_for = found[0].waited_for(_shared_drive(me, found[0])).to_document() if found else None
+        status.place = place_in_line(me, others)
+        _publish_quietly(board)
+        return Turn(False, found[0] if found else None)
+
+
+def take_back(board: StatusBoard) -> bool:
+    """One attempt, under the admission lock, of a paused activity asked to work again:
+    whether it may. It may once nothing at work uses a drive it takes turns on, no longer
+    paused as the lock is released, so the next decision sees it. Until then it asks for its
+    drives back and publishes what it waits for, the drive they share when that alone is why."""
+    layout, status = board.layout, board.status
+    with holding(layout.admission_lock):
+        status.resuming = True
+        me = Activity.from_status(status.to_document())
+        found = blockers(me, [a for a in live_activities(layout, board.last_read) if a.run_id != me.run_id])
         if found:
             status.waiting_for = found[0].waited_for(_shared_drive(me, found[0])).to_document()
-            status.place = place_in_line(me, others)
             _publish_quietly(board)
-            return Turn(False, found[0])
-        status.admitted, status.waiting_for, status.place = True, None, 0
+            return False
+        status.paused, status.resuming, status.waiting_for = False, False, None
         try:
             board.publish(patience=PUBLISH_PATIENCE)
         except OSError:
-            status.admitted = False
-            return Turn(False)
+            status.paused, status.resuming = True, True
+            return False
+        return True
+
+
+def stay_paused(status: LiveStatus) -> None:
+    """Stop asking for the drives back: a pause or a cancel came first."""
+    status.resuming, status.waiting_for = False, None
+
+
+def settle_interrupted(layout: RuntimeLayout) -> None:
+    """Record every dead activity now, under the admission lock, as an admission does."""
+    with holding(layout.admission_lock):
         reap_interrupted(layout)
-        return Turn(True)
 
 
 def withdraw(board: StatusBoard) -> None:
     """Give the claim up and wait again (a verification giving way). Published at once when
     it can be; otherwise the status pump publishes it a moment later, which keeps others
     waiting that moment longer and nothing worse."""
-    board.status.admitted, board.status.waiting_for, board.status.place = False, None, 0
+    stay_paused(board.status)
+    board.status.admitted, board.status.place = False, 0
     _publish_quietly(board)
 
 
@@ -458,12 +611,12 @@ def gives_way(layout: RuntimeLayout, status: LiveStatus) -> bool:
     """Whether a working verification should give way: a run or a repair that conflicts with
     it waits, has asked for its folders, and is held back by verifications alone — each
     judged as it judges its own turn, a drive both use counting when it takes turns on
-    it."""
+    it. One taking its drives back waits too."""
     me = Activity.from_status(status.to_document())
     everyone = [a for a in live_activities(layout) if a.run_id != me.run_id] + [me]
     for run in everyone:
-        if run.kind == KIND_VERIFICATION or run.admitted or run.claim is None \
-                or not conflict(run, me, by_drive=True):
+        if run.kind == KIND_VERIFICATION or (run.admitted and not run.resuming) or run.claim is None \
+                or not conflict(run, me, by_drive=me.holds_drives):
             continue
         held = blockers(run, [a for a in everyone if a.run_id != run.run_id])
         if held and all(a.kind == KIND_VERIFICATION for a in held):
@@ -473,4 +626,5 @@ def gives_way(layout: RuntimeLayout, status: LiveStatus) -> bool:
 
 __all__ = ["ADMISSION_INTERVAL", "Activity", "Claim", "ClaimedDrive", "PUBLISH_PATIENCE", "Turn", "WaitedFor",
            "activity_claim", "admit", "before_first_attempt", "blockers", "conflict", "gives_way", "goes_first",
-           "line_words", "live_activities", "place_in_line", "run_claim", "starting", "verification_claim", "withdraw"]
+           "line_words", "live_activities", "place_in_line", "run_claim", "settle_interrupted", "starting",
+           "stay_paused", "take_back", "verification_claim", "withdraw", "worked_on"]

@@ -1,4 +1,5 @@
-"""Shared helpers for the MirrorHold suites: import path, volume fixtures, temporary folders,
+"""Shared helpers for the MirrorHold suites: import path, volume fixtures, a job with every
+destination switched one way, temporary folders,
 a live run or verification of another process, a file held as another program holds it,
 and a second Python process saving the job file.
 
@@ -31,6 +32,7 @@ import time
 import unittest
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
@@ -75,6 +77,12 @@ def volume(n: int, letter: str = None, *, fs: str = "NTFS", free: int = 500 * GI
 
 def endpoint(vol: VolumeInfo, path: str = "") -> Endpoint:
     return Endpoint(vol.identity, path)
+
+
+def every_destination(job, on: bool):
+    """``job`` with every destination switched ``on``; with all of them off it runs nothing
+    by itself, and a run of it that names no destination serves none."""
+    return replace(job, destinations=tuple(replace(d, switched_on=on) for d in job.destinations))
 
 
 TEMPORARY_PREFIX = "mirrorhold_test_"

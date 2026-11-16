@@ -19,12 +19,18 @@ Order, each step a safe point for pause and cancel:
    changed file the engine could not open would lose its destination copy (measured),
    so every changed file is first opened the engine's way and left out if that fails
    (phase *checking changed files*, counted and a safe point per file); should one
-   still fail in the engine, its copy is moved back out of the batch. A changed file
+   still fail in the engine, its copy is moved back out of the batch. The same holds for
+   every changed file the engine set aside and did not replace before it ended — a
+   cancel, a failure, the bound on an engine making no progress — found from what the
+   engine reports it moved, so the cost is the files to move back, never the changed
+   files the engine did not reach (phase *finishing*, counted). A changed file
    whose contents the engine finds identical only has its time set: it counts as done
    and nothing moves into the batch. When the engine has gone through its whole list,
    every listed file it reported neither copied, nor identical, nor failed is recorded
    as skipped, so a run never reads as complete over a file the engine passed over.
-5. **Folders** that exist only at the source are created.
+5. **Folders** that exist only at the source are created — those a file the engine placed
+   in step 4 lies in are there already and are not asked about: on a remote each question
+   is a request to the service.
 
 While removals are held, only 4 (new files) and 5 run. Steps 2 and 3 are single
 renames on one volume, atomic each; the engine writes under a temporary name. So an
@@ -60,12 +66,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..endpoints.marker import MANAGEMENT_DIR
 from ..engine.rclone import Engine, EngineError, StopKind, Transfer, TransferStats, source_file_unreadable
 from ..planning.listing import parent_keys, path_key
 from ..planning.plan import PairPlan
+from ..records.admission import stay_paused
 from ..records.status import CancelMode, LiveStatus, Phase
 from ..storage.destination import StorageError
 from ..storage.drive import destination_storage
@@ -178,10 +185,13 @@ def apply_pair(plan: PairPlan, decision: GateDecision, *, source_root: Path, des
         if decision.applies_removals:
             _rename(plan, destination, result, status, step)
             _remove(plan, destination, batch, result, status, step)
-        _copy(plan, decision, source_root, destination, batch, engine, control, pump, list_path,
-              bandwidth_limit, result, step)
+        placed = _copy(plan, decision, source_root, destination, batch, engine, control, pump, list_path,
+                       bandwidth_limit, result, step)
         if result.cancelled is None:
+            made = {parent for key in placed for parent in parent_keys(key)}
             for relative in plan.dirs_to_create:
+                if path_key(relative) in made:
+                    continue                  # a file the engine placed lies in it
                 if not destination.is_folder(relative):
                     try:
                         destination.make_folder(relative)
@@ -287,7 +297,9 @@ def _remove(plan, destination, batch, result, status, step) -> None:
 
 
 def _copy(plan, decision, source_root, destination, batch, engine, control, pump, list_path,
-          bandwidth_limit, result, step) -> None:
+          bandwidth_limit, result, step) -> Set[str]:
+    """Copy the plan's new and changed files; returns the keys of those the engine copied or
+    found identical, each now on the destination under its name."""
     status = pump.board.status
     sizes = {e.path: e.size for e in plan.new}
     changed = []
@@ -306,7 +318,7 @@ def _copy(plan, decision, source_root, destination, batch, engine, control, pump
     sizes.update((c.source.path, c.source.size) for c in changed)
     files = [e.path for e in plan.new] + [c.source.path for c in changed]
     if not files:
-        return
+        return set()
     step()
     status.phase = Phase.COPYING
     try:
@@ -315,7 +327,7 @@ def _copy(plan, decision, source_root, destination, batch, engine, control, pump
                             configuration=destination.configuration)
     except EngineError as exc:
         result.engine_failure = str(exc)
-        return
+        return set()
     pump.watch(transfer, len(files), sum(sizes.values()))
     followed = False
     stalled: Optional[str] = None
@@ -347,19 +359,7 @@ def _copy(plan, decision, source_root, destination, batch, engine, control, pump
     if report.stop is StopKind.NONE and report.ended_as_expected:
         accounted = copied | identical | {path_key(p) for p in report.failed}
         result.skipped.extend((path, PASSED_OVER) for path in files if path_key(path) not in accounted)
-    for change in changed:
-        if change.source.key in copied or change.source.key in identical:
-            continue
-        if not destination.exists(change.destination.path) and batch.holds(change.destination.path):
-            try:
-                batch.move_back(change.destination.path)
-            except OSError as exc:
-                result.errors.append(f"{change.destination.path}: its previous copy could not be moved back out "
-                                     f"of versions: {exc.strerror or exc}")
-                continue
-            result.restored += 1
-            result.moved_to_versions -= 1
-            result.removals_done -= 1
+    _move_back(changed, copied | identical, report.moved_to_backup, destination, batch, result, status)
     status.done["moved_to_versions"] = result.moved_to_versions
     if stalled is not None:
         result.engine_failure = stalled
@@ -368,6 +368,49 @@ def _copy(plan, decision, source_root, destination, batch, engine, control, pump
     elif not report.ended_as_expected:
         detail = "; ".join(report.errors[:3]) or "no message"
         result.engine_failure = f"the engine ended with status {report.exit_code}: {detail}"
+    return copied | identical
+
+
+def _move_back(changed, done: Set[str], moved: Sequence[str], destination, batch, result, status) -> None:
+    """Move the previous copy of each changed file the engine moved into the batch and did
+    not replace (``done``: the keys it copied or found identical) back to its place.
+
+    The files are taken from the engine's report of what it moved (``moved``), never by
+    asking the destination about every changed file: on a remote each question is a request
+    to the service — about 1.4 s apiece, measured on the development machine on a OneDrive
+    remote — and an engine ended early leaves most changed files untouched, so asking about
+    each would hold a cancelled run for hours. Each file found here costs one look at its
+    place, a copy already there never replaced, and its move back. A move the engine made
+    and never reported — its process ended between the two — leaves that file's place empty
+    and its previous copy in the batch until the next run copies it again; the engine was
+    measured to report every move on each backend tested. The step counts what it examined,
+    so a stopping run shows how far it is; it is the cancel's own cleanup and does not stop
+    for one."""
+    moved_keys = {path_key(p) for p in moved}
+    pending = [c for c in changed if c.source.key not in done and c.source.key in moved_keys]
+    if not pending:
+        return
+    phase = status.phase
+    status.phase, status.examined, status.to_examine = Phase.FINISHING, 0, len(pending)
+    try:
+        for n, change in enumerate(pending):
+            status.examined = n
+            relative = change.destination.path
+            if destination.exists(relative):
+                continue
+            try:
+                batch.move_back(relative)
+            except OSError as exc:
+                if isinstance(exc, FileNotFoundError) and not batch.holds(relative):
+                    continue                  # nothing of it in the batch to move back
+                result.errors.append(f"{relative}: its previous copy could not be moved back out of versions: "
+                                     f"{exc.strerror or exc}")
+                continue
+            result.restored += 1
+            result.moved_to_versions -= 1
+            result.removals_done -= 1
+    finally:
+        status.phase, status.examined, status.to_examine = phase, 0, 0
 
 
 def _progress(stats: Optional[TransferStats]) -> Optional[Tuple[int, ...]]:
@@ -410,6 +453,7 @@ def _follow(transfer: Transfer, control: RunControl, status: LiveStatus, result:
         wanted = control.wanted
         if wanted.cancel is not None and wanted.cancel is not applied_cancel:
             status.cancelling, status.paused = wanted.cancel, False
+            stay_paused(status)
             applied_cancel, applied_pause = wanted.cancel, False
             try:
                 if wanted.cancel is CancelMode.IMMEDIATE:
@@ -419,13 +463,16 @@ def _follow(transfer: Transfer, control: RunControl, status: LiveStatus, result:
             except EngineError as exc:
                 result.errors.append(f"{exc}; stopping at once instead")
                 transfer.stop_now()
-        elif wanted.cancel is None and wanted.paused != applied_pause:
-            applied_pause = wanted.paused
-            try:
-                transfer.suspend() if wanted.paused else transfer.resume()
-                status.paused = wanted.paused
-            except EngineError as exc:
-                result.errors.append(f"the engine could not be {'paused' if wanted.paused else 'resumed'}: {exc}")
+        elif wanted.cancel is None and (wanted.paused or applied_pause):
+            pause = control.pause_wanted()
+            if pause != applied_pause:
+                applied_pause = pause
+                try:
+                    transfer.suspend() if pause else transfer.resume()
+                    status.paused = pause
+                except EngineError as exc:
+                    status.paused = transfer.suspended
+                    result.errors.append(f"the engine could not be {'paused' if pause else 'resumed'}: {exc}")
         if applied_cancel is CancelMode.GRACEFUL and not ending:
             stats = transfer.stats()
             if stats is not None and not stats.in_flight:

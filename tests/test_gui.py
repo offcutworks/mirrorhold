@@ -7,7 +7,9 @@ surfaces — free space and the verification reminder in the job list, copies fo
 differ, a verification in the Runs tab and the history, the Verify... dialog and a
 verification's details, the editor's versions settings, old versions in a preview and
 in a run's details; groups of jobs in the list, what a selection of several rows allows,
-and the words about starting a cancelled run or an unfinished verification again; the
+each destination's switch — read in the list, left out of a run of its job or group,
+run when selected itself, kept by the editor —, and the words about starting a cancelled
+run or an unfinished verification again; the
 tone of a row whose drive is not attached, and the main window's remembered place; the
 application identity the GUI's process takes, claimed in a process of its own; and what
 the window tells of every activity — how far a verification at work is, a pass that did
@@ -40,7 +42,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from support import GIB, PROJECT, TempDirTest, endpoint, held, live_activity, volume
+from support import GIB, PROJECT, TempDirTest, endpoint, every_destination, held, live_activity, volume
 from test_engine_contract import INSTALLED
 
 from mirrorhold import exchange
@@ -62,8 +64,9 @@ from mirrorhold.locations import runtime_layout
 from mirrorhold.notifications.message import notice_for
 from mirrorhold.planning.listing import Occupancy
 from mirrorhold.records.diagnostics import ActivityLog
-from mirrorhold.records.record import (DONE_KEYS, FIRST_RUN_REASON, LEFT_KEYS, PLANNED_KEYS, Outcome, ReadMode,
-                                       RunRecord, SourceRead, VersionsCleaned, read_records, write_record)
+from mirrorhold.records.record import (DONE_KEYS, FIRST_RUN_REASON, LEFT_KEYS, NEVER_BEGUN, PLANNED_KEYS, Outcome,
+                                       ReadMode, RunRecord, SourceRead, VersionsCleaned, destination_state,
+                                       read_records, write_record)
 from mirrorhold.records.admission import CONFIGURATION, Activity, WaitedFor, _shared_drive, run_claim
 from mirrorhold.records.status import KIND_RUN, ObservedRun
 from mirrorhold.remotes.facts import Reach, RemoteFacts, RemoteSetup, SetupState
@@ -90,9 +93,9 @@ from mirrorhold_gui.history_model import (JobHistory, empty_words, history_entri
                                           selection_entries, source_words, start_details, started_by)
 from mirrorhold_gui.groups_model import (Selection, collapsed_groups, delete_group_question, group_name_problem,
                                          not_verified_why, remove_jobs_question, reordered, run_several,
-                                         verify_several, with_collapsed)
-from mirrorhold_gui.jobs_model import (RemotePlace, Tone, arrange, build_rows, first_backup_question, job_has_run,
-                                       log_job, reason_words, row_by_iid, waiting_words)
+                                         keyboard_menu, switched, switching_on, verify_several, with_collapsed)
+from mirrorhold_gui.jobs_model import (RemotePlace, Switch, Tone, arrange, build_rows, first_backup_question,
+                                       job_has_run, log_job, reason_words, row_by_iid, waiting_words)
 from mirrorhold_gui.prefs_model import (AT_THE_SAME_TIME, AUTOMATIC, DRIVE_NOTE, DRIVE_TITLE, KEEP_AWAKE,
                                         KEEP_AWAKE_NOTE, NAME_AT_SHUTDOWN, NAME_AT_SHUTDOWN_NOTE, NO_COMMAND,
                                         ONE_AT_A_TIME, TYPE_PASSWORD, WORK_TITLE, RemotesDraft, automation_problem,
@@ -104,9 +107,10 @@ from mirrorhold_gui.preview_model import PairState, PreviewWorker, Quantity, Wor
 from mirrorhold_gui.refresh import Refresher, RunWatcher, Settling, ended_runs, observe
 from mirrorhold_gui.remote_model import (NAME_CONFIGURATION, Background, RemoteAccess, at_top, child_folder,
                                          parent_folder, window_message)
-from mirrorhold_gui.runs_model import (REQUEST_TITLES, closing_question, destination_number, destination_places,
-                                      kind_counts, live_panels, not_reached_words, not_started_words, run_panel,
-                                      unreadable_panel, unreadable_words, waiting_note, waits)
+from mirrorhold_gui.runs_model import (REQUEST_TITLES, also_cancel_words, closing_question, destination_number,
+                                      destination_places, kind_counts, live_panels, not_reached_words,
+                                      not_started_words, pause_words, run_panel, unreadable_panel, unreadable_words,
+                                      waiting_behind, waiting_note, waits)
 from mirrorhold_gui.session import GuiSession, LaunchProblem, NotStarted, StoreConflict
 from mirrorhold_gui.skipped_model import unbacked_report, whole_words
 from mirrorhold_gui.startup_model import HELD_TEXT, HELD_TITLE, StartupKind, startup_problem
@@ -247,6 +251,22 @@ class JobRowsTest(unittest.TestCase):
         self.assertTrue(job_has_run([record(self.job, 1, Outcome.COMPLETED)]))
         self.assertTrue(job_has_run([record(self.job, 1, Outcome.FAILED, done={"files_copied": 3})]))
 
+    def test_a_run_that_died_before_it_began_has_not_run(self):
+        never = record(self.job, 1, Outcome.INTERRUPTED, reasons=(NEVER_BEGUN,))
+        self.assertFalse(job_has_run([never]))
+        self.assertFalse(destination_state([never], self.job.destinations[0].marker_id).first_run_confirmed)
+        self.assertEqual(self.rows(records=[never]).destinations[0].status, "Interrupted - next run continues")
+        self.assertEqual(reason_words(NEVER_BEGUN), "its process ended before it began")
+
+    def test_a_run_cancelled_before_it_reached_a_destination_has_not_run_there(self):
+        for reason in ("cancelled-while-waiting", "cancelled"):
+            cancelled = record(self.job, 1, Outcome.CANCELLED, reasons=(reason,))
+            self.assertFalse(job_has_run([cancelled]), reason)
+            self.assertFalse(destination_state([cancelled], self.job.destinations[0].marker_id).first_run_confirmed)
+        stopped = record(self.job, 1, Outcome.CANCELLED, reasons=("cancelled-graceful",))
+        self.assertTrue(job_has_run([stopped]))
+        self.assertTrue(destination_state([stopped], self.job.destinations[0].marker_id).first_run_confirmed)
+
 
 class EditorTest(TempDirTest):
     def setUp(self):
@@ -298,7 +318,7 @@ class EditorTest(TempDirTest):
         self.assertIn("input-holds", [c.code for c in check(draft, self.volumes, (), ()).checks])
 
     def test_editing_keeps_marker_identities_and_the_settings_it_does_not_show(self):
-        base = replace(check(self.draft(), self.volumes, (), ()).job, enabled=False,
+        base = replace(every_destination(check(self.draft(), self.volumes, (), ()).job, False),
                        triggers=Triggers(True, "daily 21:00"), version_cleanup=VersionCleanup(30))
         draft = JobDraft.from_job(base, source_editable=False)
         draft.name = "Work renamed"
@@ -308,10 +328,20 @@ class EditorTest(TempDirTest):
         self.assertEqual(job.job_id, base.job_id)
         self.assertEqual(job.destinations[1].marker_id, base.destinations[0].marker_id)
         self.assertNotIn(job.destinations[0].marker_id, [d.marker_id for d in base.destinations])
-        self.assertEqual((job.enabled, job.triggers, job.version_cleanup),
-                         (False, Triggers(True, "daily 21:00"), VersionCleanup(30)))
+        self.assertEqual(([d.switched_on for d in job.destinations], job.triggers, job.version_cleanup),
+                         ([True, False], Triggers(True, "daily 21:00"), VersionCleanup(30)))
         with self.assertRaises(EndpointError):
             draft.set_source(str(self.vol_s), self.volumes)
+
+    def test_editing_keeps_each_destinations_switch_and_a_destination_added_is_on(self):
+        made = check(self.draft(), self.volumes, (), ()).job
+        base = replace(made, destinations=(replace(made.destinations[0], switched_on=False),))
+        draft = JobDraft.from_job(base, source_editable=False)
+        draft.add_destination(str(self.vol_d / "Second"), self.volumes)
+        job = check(draft, self.volumes, (), ()).job
+        self.assertEqual([(d.marker_id == base.destinations[0].marker_id, d.switched_on) for d in job.destinations],
+                         [(True, False), (False, True)])
+        self.assertEqual(job.switched_on, (2,))
 
     def test_another_jobs_destination_is_refused(self):
         other = check(self.draft(), self.volumes, (), ()).job
@@ -744,6 +774,54 @@ class RunsModelTest(unittest.TestCase):
         self.assertEqual((immediate.phase, immediate.can_stop_now, immediate.can_cancel),
                          ("stopping now", False, False))
 
+    def test_a_run_moving_earlier_copies_back_says_how_far_it_is(self):
+        immediate = self.panel(cancelling="immediate", phase="finishing", examined=3, to_examine=40)
+        self.assertEqual(immediate.phase, "stopping now: moving earlier copies back out of versions   3 of 40")
+        graceful = self.panel(cancelling="graceful", phase="finishing", examined=0, to_examine=2)
+        self.assertEqual(graceful.phase, "cancelling: moving earlier copies back out of versions   0 of 2")
+        failed = self.panel(phase="finishing", examined=1, to_examine=2)
+        self.assertEqual(failed.phase, "moving earlier copies back out of versions   1 of 2")
+        self.assertEqual(self.panel(phase="finishing").phase, "finishing")
+        self.assertEqual(self.panel(cancelling="immediate", phase="finishing").phase, "stopping now")
+
+    def test_one_taking_its_drives_back_says_whom_it_waits_for_and_can_be_paused_again(self):
+        waited = dict(run_id="w" * 32, kind="run", job_name="Work", drive="drive I:")
+        back = self.panel(paused=True, resuming=True, waiting_for=waited, rate=1024 ** 2, eta_seconds=120,
+                          planned={"files_to_copy": 10, "bytes_to_copy": 1024 ** 2}, done={"files_copied": 5})
+        self.assertEqual(back.phase, "resuming, waiting for 'Work'")
+        self.assertEqual(back.note, "Both use drive I:.")
+        self.assertEqual((back.paused, back.resuming, back.can_pause, back.can_resume), (False, True, True, False))
+        self.assertEqual(back.counts, "5 of 10 files   0 bytes of 1.0 MiB")
+        self.assertEqual(pause_words(back), "Pause")
+
+    def test_a_verification_and_a_repair_taking_their_drives_back_say_so_too(self):
+        waited = dict(run_id="w" * 32, kind="run", job_name="Work")
+        for kind in ("verification", "repair"):
+            panel = run_panel(live(self.job, kind=kind, verify={"files": 2}, paused=True, resuming=True,
+                                   waiting_for=waited))
+            self.assertEqual((panel.phase, panel.resuming, panel.can_pause), ("resuming, waiting for 'Work'", True, True))
+
+    def test_a_waiting_run_or_repair_with_others_before_it_can_run_next(self):
+        behind = dict(phase="waiting", pair_index=0, place=2)
+        self.assertTrue(self.panel(**behind).can_run_next)
+        self.assertFalse(self.panel(phase="waiting", pair_index=0, place=1).can_run_next, "next in line already")
+        self.assertFalse(self.panel().can_run_next, "at work")
+        self.assertTrue(run_panel(live(self.job, kind="repair", **behind)).can_run_next)
+        self.assertFalse(run_panel(live(self.job, kind="verification", verify={}, **behind)).can_run_next)
+        self.assertFalse(run_panel(ObservedRun(live(self.job, **behind).status, False)).can_run_next, "no longer alive")
+
+    def test_a_cancel_names_the_runs_of_its_job_that_would_start_at_once(self):
+        other = new_job("Other", endpoint(volume(1, "S"), "O"), [endpoint(volume(2, "F"), "M2")])
+        working = live(self.job, run_id="a" * 32).status
+        behind = live(self.job, run_id="b" * 32, phase="waiting").status
+        unrelated = live(other, run_id="c" * 32, phase="waiting").status
+        check = live(self.job, run_id="d" * 32, phase="waiting", kind="verification").status
+        self.assertEqual(waiting_behind([working, behind, unrelated, check], working), ("b" * 32,))
+        self.assertEqual(waiting_behind([working], working), ())
+        self.assertEqual(waiting_behind([working, behind], behind), (), "nothing starts when one that waits ends")
+        self.assertEqual(also_cancel_words(1), "Also cancel the run of this job waiting behind it")
+        self.assertEqual(also_cancel_words(2), "Also cancel the 2 runs of this job waiting behind it")
+
     def test_only_live_runs_have_panels(self):
         self.assertEqual(live_panels([ObservedRun(live(self.job).status, False)]), [])
 
@@ -1063,7 +1141,7 @@ class GuiLivePathTest(TempDirTest):
 
 class WhenToRunTest(TempDirTest):
     """The editor's *When to run*: a new job runs only when started; automatic runs are
-    additions, and pausing keeps them."""
+    additions, and an edit keeps them and each destination's switch, off or on."""
 
     def setUp(self):
         super().setUp()
@@ -1080,24 +1158,33 @@ class WhenToRunTest(TempDirTest):
 
     def test_a_new_job_runs_only_when_started(self):
         job = check(self.draft(), self.volumes, (), ()).job
-        self.assertEqual((job.triggers, job.enabled), (Triggers(False, None), True))
+        self.assertEqual((job.triggers, job.switched_on), (Triggers(False, None), (1,)))
         self.assertFalse(self.draft().automatic_chosen)
 
-    def test_automatic_runs_are_chosen_and_paused(self):
+    def test_automatic_runs_are_chosen_and_kept_while_every_destination_is_off(self):
         draft = self.draft()
         draft.on_arrival, draft.scheduled, draft.days_kind = True, True, WEEKLY
         draft.schedule_time_text, draft.schedule_days = "7:30", {3, 0}
         self.assertTrue(draft.automatic_chosen)
         job = check(draft, self.volumes, (), ()).job
-        self.assertEqual((job.triggers, job.enabled), (Triggers(True, "weekly mon,thu 07:30"), True))
-        draft.paused = True
-        job = check(draft, self.volumes, (), ()).job
-        self.assertEqual((job.triggers, job.enabled), (Triggers(True, "weekly mon,thu 07:30"), False))
-        again = JobDraft.from_job(job, source_editable=True)
+        self.assertEqual((job.triggers, job.switched_on), (Triggers(True, "weekly mon,thu 07:30"), (1,)))
+        again = JobDraft.from_job(every_destination(job, False), source_editable=True)
         self.assertEqual((again.on_arrival, again.scheduled, again.days_kind, again.schedule_time_text,
-                          again.schedule_days, again.paused), (True, True, WEEKLY, "07:30", {0, 3}, True))
+                          again.schedule_days, [d.switched_on for d in again.destinations]),
+                         (True, True, WEEKLY, "07:30", {0, 3}, [False]))
+        job = check(again, self.volumes, (), ()).job
+        self.assertEqual((job.triggers, job.switched_on), (Triggers(True, "weekly mon,thu 07:30"), ()))
         draft.days_kind = DAILY
         self.assertEqual(check(draft, self.volumes, (), ()).job.triggers.schedule, "daily 07:30")
+
+    def test_a_job_without_automatic_runs_keeps_its_switches_off_and_on(self):
+        off = every_destination(check(self.draft(), self.volumes, (), ()).job, False)
+        job = check(JobDraft.from_job(off, source_editable=True), self.volumes, (), ()).job
+        self.assertEqual((job.triggers, job.switched_on), (Triggers(False, None), ()))
+        again = JobDraft.from_job(job, source_editable=True)
+        self.assertEqual([d.switched_on for d in again.destinations], [False])
+        on = JobDraft.from_job(every_destination(job, True), source_editable=True)
+        self.assertEqual(check(on, self.volumes, (), ()).job.switched_on, (1,))
 
     def test_a_schedule_needs_a_time_and_a_day(self):
         draft = self.draft()
@@ -1782,7 +1869,8 @@ class LargeLibraryWordsTest(PreviewCase):
 
 class GroupsModelTest(unittest.TestCase):
     """Groups in the job list: the arrangement, a group's status and last success, what a
-    selection allows, the questions asked, group names and the groups remembered closed."""
+    selection allows, the questions asked, group names, the groups remembered closed, and
+    which destinations a switch changes."""
 
     def setUp(self):
         self.s, self.d = volume(1, "S", label="Media"), volume(2, "F", label="Backup 1")
@@ -1906,6 +1994,138 @@ class GroupsModelTest(unittest.TestCase):
         self.assertEqual(collapsed_groups(state), {"a", "b"})
         self.assertEqual(with_collapsed(state, ()), {"geometry": "1x1"})
         self.assertEqual(collapsed_groups({"collapsed_groups": "a"}), set())
+
+    def test_a_job_with_every_destination_off_is_left_out_when_run_whole_and_runs_through_a_destination(self):
+        self.contents = self.contents.with_job(self.switched(self.camera, False))
+        entries = self.entries()
+        pictures, _empty, work = entries
+        by_iid = row_by_iid(entries)
+        phone, camera = pictures.jobs
+        self.assertEqual((phone.switch, camera.switch, work.switch), (Switch.ON, Switch.OFF, Switch.ON))
+        self.assertEqual(pictures.label, "Pictures      (2 jobs)")
+        self.assertEqual(pictures.status, "Phone: Ready to run", "a job switched off is not counted in its group")
+        group = Selection.of([pictures], by_iid)
+        self.assertEqual(([j.name for j in group.reached], group.switched_off), (["Phone", "Camera"], (camera,)))
+        self.assertEqual(([j.name for j in group.runnable], [j.name for j in group.startable]), (["Phone"], ["Phone"]))
+        self.assertEqual(len(group.verifiable), 2, "verifying is not affected by the switch")
+        plan = run_several(group.runnable, "Pictures", switched_off=group.switched_off)
+        self.assertEqual((plan.title, plan.start), ('Run 1 job of "Pictures"?', (self.phone.job_id,)))
+        self.assertEqual(plan.text.splitlines(), ["Starts: Phone.", "Switched off, not run: Camera."])
+        for named in ([camera], [pictures, camera], [pictures, camera.destinations[0]]):
+            selection = Selection.of(named, by_iid)
+            self.assertEqual((selection.switched_off, camera in selection.startable), ((camera,), False),
+                             "a job run whole, its own row or its group's selected, is left out")
+        selection = Selection.of([camera.destinations[0]], by_iid)
+        self.assertEqual((selection.switched_off, camera in selection.startable), ((), True),
+                         "a destination selected itself runs whatever its switch")
+        self.contents = self.contents.with_job(self.switched(self.phone, False))
+        entries = self.entries()
+        off = Selection.of([entries[0]], row_by_iid(entries))
+        self.assertEqual((len(off.switched_off), off.startable), (2, ()), "a group of jobs all switched off runs none")
+        self.assertEqual(entries[0].label, "Pictures      (2 jobs)")
+
+    def switched(self, job, *on):
+        """``job`` with its destinations switched as ``on`` says, in order."""
+        return replace(job, destinations=tuple(replace(d, switched_on=s) for d, s in zip(job.destinations, on)))
+
+    def test_destinations_switched_off_read_so_and_are_left_out_of_a_run_of_their_job_or_group(self):
+        trip = new_job("Trip", endpoint(self.s, "Trip"), [endpoint(self.d, "Trip"), endpoint(self.d, "Trip 2")])
+        trip = self.switched(trip, True, False)
+        camera = self.switched(self.camera, False)
+        group = new_group("Pictures", (self.phone.job_id, camera.job_id, trip.job_id))
+        self.contents = StoreContents((camera, self.phone, trip), groups=(group,))
+        markers = {(j.job_id, d.marker_id): MarkerState.MATCH for j in self.contents.jobs for d in j.destinations}
+        entries = self.entries(markers=markers)
+        (pictures,) = entries
+        by_iid = row_by_iid(entries)
+        phone, camera_row, trip_row = pictures.jobs
+        self.assertEqual((phone.switch, camera_row.switch, trip_row.switch), (Switch.ON, Switch.OFF, Switch.SOME))
+        off = trip_row.destinations[1]
+        self.assertEqual((off.switched_on, off.status, off.tone, off.needs_review),
+                         (False, "Switched off", Tone.ABSENT, False))
+        self.assertEqual((camera_row.status, camera_row.tone), ("Switched off", Tone.ABSENT))
+        self.assertEqual(trip_row.status, phone.status, "a destination switched off does not count in its job")
+        self.assertEqual(pictures.status, f"{phone.status} (2 jobs)", "nor a job switched off in its group")
+        self.assertEqual(trip_row.serving(None).destinations, (trip_row.destinations[0],))
+        whole = Selection.of([pictures], by_iid)
+        self.assertEqual((whole.switched_off, [j.name for j in whole.startable]), ((camera_row,), ["Phone", "Trip"]))
+        self.assertEqual(len(whole.verifiable), 4, "verifying is not affected by the switches")
+        plan = run_several(whole.runnable, "Pictures", chosen=whole.chosen, switched_off=whole.switched_off)
+        self.assertEqual((plan.title, plan.start), ('Run 2 jobs of "Pictures"?', (self.phone.job_id, trip.job_id)))
+        self.assertEqual(plan.text.splitlines()[:2], ["Starts: Phone, Trip (destination 1).",
+                                                      "Switched off, not run: Camera, Trip 2."])
+        self.assertEqual(Selection.of([camera_row], by_iid).startable, (), "a job run whole with none on runs nothing")
+        named = Selection.of([camera_row.destinations[0]], by_iid)
+        self.assertEqual((named.switched_off, named.startable, named.chosen),
+                         ((), (camera_row,), {camera.job_id: (camera.destinations[0].marker_id,)}),
+                         "a destination selected itself runs whatever its switch")
+
+    def test_a_group_of_jobs_with_every_destination_switched_off_reads_so(self):
+        self.contents = StoreContents((self.switched(self.camera, False), self.switched(self.phone, False), self.work),
+                                      groups=(self.pictures,))
+        pictures, work = self.entries()
+        self.assertEqual((pictures.status, pictures.tone), ("Switched off", Tone.ABSENT))
+        self.assertNotEqual(work.status, "Switched off")
+
+    def job_rows(self):
+        """The list's job rows by name, a group's and those in no group alike."""
+        return {job.name: job for entry in self.entries() for job in getattr(entry, "jobs", (entry,))}
+
+    def test_switching_changes_the_destinations_named_alone_and_saves_nothing_when_none_changes(self):
+        trip = new_job("Trip", endpoint(self.s, "Trip"), [endpoint(self.d, "Trip"), endpoint(self.d, "Trip 2")])
+        self.contents = StoreContents((self.camera, self.phone, trip, self.work), groups=(self.pictures,))
+        rows = self.job_rows()
+        first, second = rows["Trip"].destinations
+        self.assertEqual((switching_on((first, second)), switching_on(rows["Camera"].destinations)), (False, False),
+                         "every one on: switched off")
+        one_off = switched(self.contents, (second,), False)
+        self.assertEqual([d.switched_on for d in one_off.job(trip.job_id).destinations], [True, False])
+        self.assertEqual([one_off.job(j.job_id) for j in (self.camera, self.phone, self.work)],
+                         [self.camera, self.phone, self.work], "no other job changes")
+        self.assertEqual(one_off.groups, self.contents.groups)
+        self.assertIsNone(switched(one_off, (second,), False), "every one already reads as asked: nothing to save")
+
+        self.contents = one_off
+        rows = self.job_rows()
+        both = rows["Trip"].destinations + rows["Camera"].destinations
+        self.assertEqual((switching_on(rows["Trip"].destinations), switching_on(both)), (True, True),
+                         "some off: switched on")
+        on = switched(one_off, both, True)
+        self.assertEqual([d.switched_on for d in on.job(trip.job_id).destinations], [True, True])
+        self.assertEqual(on.job(self.camera.job_id), self.camera, "a job whose destinations already read so")
+        off = switched(one_off, both, False)
+        self.assertEqual([[d.switched_on for d in off.job(j.job_id).destinations] for j in (trip, self.camera)],
+                         [[False, False], [False]])
+        self.assertIsNone(switched(StoreContents((self.work,)), both, False), "their jobs are no longer in the file")
+
+    def test_a_switch_finds_its_destination_by_its_marker_when_the_job_was_reordered_since(self):
+        trip = new_job("Trip", endpoint(self.s, "Trip"), [endpoint(self.d, "Trip"), endpoint(self.d, "Trip 2")])
+        trip = replace(trip, destinations=(trip.destinations[0], replace(trip.destinations[1], switched_on=False)))
+        self.contents = StoreContents((trip,))
+        first, second = self.job_rows()["Trip"].destinations
+        stored = self.contents.job(trip.job_id)
+        reordered_since = self.contents.with_job(replace(stored, destinations=tuple(reversed(stored.destinations))))
+        on = switched(reordered_since, (second,), True)
+        self.assertIsNotNone(on, "the destination switched off is now the first")
+        self.assertEqual([(d.marker_id, d.switched_on) for d in on.job(trip.job_id).destinations],
+                         [(second.marker_id, True), (first.marker_id, True)])
+
+    def test_the_keyboard_opens_the_selections_menu_under_a_row_of_it_the_list_shows(self):
+        # A group holding a job holding a destination; which of them are open is each case's.
+        def ancestors(opened):
+            return {"destination": [("job", "job" in opened), ("group", "group" in opened)],
+                    "job": [("group", "group" in opened)], "group": [], "other": []}.__getitem__
+        every = ancestors({"group", "job"})
+        self.assertIsNone(keyboard_menu("", (), every), "nothing selected or focused")
+        self.assertEqual(keyboard_menu("job", (), every), ("job", "job"), "the focused row is selected first")
+        self.assertEqual(keyboard_menu("job", ("other", "job"), every), (None, "job"), "under the focused row")
+        self.assertEqual(keyboard_menu("other", ("job", "destination"), every), (None, "job"),
+                         "the focus outside the selection: under its first row")
+        self.assertEqual(keyboard_menu("destination", ("destination",), ancestors({"group"})),
+                         (None, "job"), "a row its closed job hides: under the job")
+        self.assertEqual(keyboard_menu("destination", ("destination",), ancestors(set())), (None, "group"),
+                         "under the outermost closed row, never opening a group the user closed")
+        self.assertEqual(keyboard_menu("job", (), ancestors(set())), ("job", "group"))
 
 
 class StartingAgainTest(TempDirTest):
@@ -4121,6 +4341,39 @@ class RemoteFoldersTest(unittest.TestCase):
 
         self.assertEqual(wait(lambda: 3).value, 3)
         self.assertEqual(wait(lambda: 1 / 0).failure, "division by zero")
+
+
+class BetweenDestinationsWordsTest(unittest.TestCase):
+    """A run waiting for a turn between two of its destinations (the maintainer's decision of
+    2026-11-10) reads as a waiting run does: in the Runs tab naming no destination, in the job
+    list on each destination it has not finished, and its cancel asks about the runs of its job
+    waiting behind it, which start only once it ends."""
+
+    def setUp(self):
+        self.s, self.d, self.e = volume(1, "S"), volume(2, "F"), volume(3, "K")
+        self.job = new_job("Photos", endpoint(self.s, "P"), [endpoint(self.d, "M"), endpoint(self.e, "M")])
+        holder = dict(run_id="h" * 32, kind="run", job_name="Holder", drive="drive K:")
+        self.between = live(self.job, phase="waiting", pair_index=0, admitted=False, place=1, waiting_for=holder,
+                            finished=[[1, Outcome.COMPLETED.value]],
+                            markers=[d.marker_id for d in self.job.destinations])
+
+    def test_the_runs_tab_says_whom_it_waits_for_and_names_no_destination(self):
+        panel = run_panel(self.between)
+        self.assertEqual((panel.title, panel.phase, panel.waiting), ("Photos", "waiting for 'Holder'", True))
+        self.assertEqual(panel.note, "Both use drive K:. Next in line.")
+
+    def test_the_job_list_shows_it_waiting_on_the_destination_it_has_not_finished(self):
+        markers = {(self.job.job_id, d.marker_id): MarkerState.MATCH for d in self.job.destinations}
+        done = (record(self.job, 1, Outcome.COMPLETED),)
+        row = build_rows(StoreContents((self.job,)), (self.s, self.d, self.e), markers, {self.job.job_id: done},
+                         [self.between])[0]
+        self.assertEqual([d.status for d in row.destinations],
+                         ["Completed", waiting_words(self.between.status)])
+        self.assertEqual(waiting_words(self.between.status), "Next in line, waiting for 'Holder' (drive K:)")
+
+    def test_its_cancel_names_the_runs_of_its_job_waiting_behind_it(self):
+        behind = live(self.job, run_id="b" * 32, phase="waiting", pair_index=0).status
+        self.assertEqual(waiting_behind([self.between.status, behind], self.between.status), ("b" * 32,))
 
 
 if __name__ == "__main__":

@@ -4,22 +4,30 @@
 ; folder it installs holds the zip's files byte for byte, plus the uninstaller Inno Setup
 ; writes beside them.
 ;
-; Install: for the user alone, without administrator rights, always into
-; %LOCALAPPDATA%\Programs\MirrorHold; then, on a first install, the copy sets itself up as
-; Set up does in a portable release (python -m mirrorhold install): its Start menu entry and
-; its scheduled tasks. The setup program makes no shortcut, file association or Start menu
-; entry of its own. A refusal by the program leaves no copy behind.
+; Install: for the user alone, without administrator rights, into the folder the user chooses,
+; %LOCALAPPDATA%\Programs\MirrorHold unless they choose another; then, on a first install, the
+; copy sets itself up as Set up does in a portable release (python -m mirrorhold install): its
+; Start menu entry and its scheduled tasks. The setup program makes no shortcut, file
+; association or Start menu entry of its own. A refusal by the program leaves no copy behind.
 ;
-; One folder: Inno Setup takes a folder named by /DIR= (which winget install --location
-; passes) or by a Dir in the file /LOADINF= names even though no folder page is shown. A copy
-; installed elsewhere would be one no later setup program finds to update, so any other
-; folder is refused at the start, before anything changes, and Setup ends with Inno Setup's
-; status for a setup that did not initialize, 1.
+; The folder: a first install shows the folder page, which also shows a folder named by /DIR=
+; (which winget install --location passes) or by a Dir in the file /LOADINF= names. A refused
+; install and the uninstall both delete the folder with everything in it, so a first install
+; takes only a folder that holds nothing of the user's and stays reachable: a full path on a
+; drive Windows counts as fixed (a USB disk it counts so passes), not a drive's root, empty or
+; not there yet, with nothing of the user's beside it under the name an update sets a folder
+; aside by, where the user can write, and outside the folder that holds the jobs and their
+; records, judged on the folder as Windows resolves it (a short name, a junction, a
+; substituted drive). The page refuses any other when it is left; a silent install, which
+; shows no page, refuses it at the start, before anything changes, and Setup ends with Inno
+; Setup's status for a setup that did not initialize, 1.
 ;
-; Update: a newer setup program moves the copy's folder aside, installs the newer files into
-; a fresh folder, then deletes the old one, so no file of the older release stays; the copy
-; keeps its setup, which names the folder, and nothing is set up again. Should the update not
-; finish, the old folder is put back.
+; Update: the copy stays in the folder it was installed in, which Windows' list of installed
+; apps records and the copy's setup names, and no folder page is shown; told any other folder,
+; the setup program refuses at the start, as above. A newer setup program moves the copy's
+; folder aside, installs the newer files into a fresh folder, then deletes the old one, so no
+; file of the older release stays; the copy keeps its setup, which names the folder, and
+; nothing is set up again. Should the update not finish, the old folder is put back.
 ;
 ; Uninstall, from Windows' list of installed apps: the copy removes its setup only if it is
 ; the one set up (python -m mirrorhold uninstall --if-set-up-here), so another copy's
@@ -80,8 +88,12 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 DefaultDirName={autopf}\MirrorHold
-UsePreviousAppDir=no
-DisableDirPage=yes
+UsePreviousAppDir=yes
+DisableDirPage=auto
+DirExistsWarning=no
+AllowRootDirectory=no
+AllowNetworkDrive=no
+AllowUNCPath=no
 DisableProgramGroupPage=yes
 DisableWelcomePage=yes
 CloseApplications=no
@@ -125,6 +137,9 @@ const
   AsideSuffix = '.previous';
   GenericWrite = $40000000;
   OpenExisting = 3;
+  BackupSemantics = $02000000;  // what CreateFile needs to open a folder
+  ShareAll = 7;
+  DriveFixed = 3;           // GetDriveType's answer for a drive Windows counts as fixed
   Patience = 5000;          // ms a file or folder briefly held (a virus scanner) is waited for
   RefusedExitCode = 20;     // the program refused to be set up; nothing was left installed
   AtWork = 'MirrorHold is at work: its window, or a run, a verification or a repair started from this copy, ' +
@@ -133,6 +148,7 @@ const
 
 var
   PreviousLabel: String;    // the release this setup replaces; '' on a first install
+  PreviousFolder: String;   // the folder the copy this setup replaces lies in; '' on a first install
   Updating: Boolean;
   MovedAside: Boolean;
   Completed: Boolean;
@@ -144,6 +160,10 @@ function CreateFile(lpFileName: String; dwDesiredAccess, dwShareMode: Cardinal; 
   external 'CreateFileW{#At}kernel32.dll stdcall';
 function CloseHandle(hObject: NativeInt): Boolean;
   external 'CloseHandle{#At}kernel32.dll stdcall';
+function GetDriveType(lpRootPathName: String): Cardinal;
+  external 'GetDriveTypeW{#At}kernel32.dll stdcall';
+function GetFinalPathNameByHandle(hFile: NativeInt; lpszFilePath: String; cchFilePath, dwFlags: Cardinal): Cardinal;
+  external 'GetFinalPathNameByHandleW{#At}kernel32.dll stdcall';
 
 function AppFolder: String;
 begin
@@ -263,7 +283,7 @@ end;
 // The folder the command line names for the install, '' where it names none: /DIR=, then a
 // Dir in the file /LOADINF= names, which Inno Setup lets override it; either may start with
 // expand:, whose constants Inno Setup expands. A value that cannot be expanded stays as
-// written, which names no folder of ours and is refused.
+// written, which is no full path and no installed copy's folder, and is refused.
 function RequestedFolder: String;
 var
   I: Integer;
@@ -290,29 +310,219 @@ end;
 
 // Folders compared as written, without regard to case or a final backslash: the same folder
 // reached another way (a short name, a junction) is refused too, and the refusal's remedy,
-// naming no folder at all, installs it.
+// naming no folder at all, updates it.
 function SameFolder(const A, B: String): Boolean;
 begin
   Result := CompareText(RemoveBackslashUnlessRoot(ExpandFileName(A)), RemoveBackslashUnlessRoot(ExpandFileName(B))) = 0;
 end;
 
+// Whether Inner is Outer or lies inside it, compared as written, without regard to case.
+function Within(const Inner, Outer: String): Boolean;
+var
+  I, O: String;
+begin
+  I := AddBackslash(ExpandFileName(Inner));
+  O := AddBackslash(ExpandFileName(Outer));
+  Result := CompareText(Copy(I, 1, Length(O)), O) = 0;
+end;
+
+function HoldsAnything(const Folder: String): Boolean;
+var
+  Found: TFindRec;
+begin
+  Result := False;
+  if FindFirst(AddBackslash(Folder) + '*', Found) then
+    try
+      repeat
+        Result := (Found.Name <> '.') and (Found.Name <> '..');
+      until Result or not FindNext(Found);
+    finally
+      FindClose(Found);
+    end;
+end;
+
+// The nearest folder of Path that exists, and the rest of Path below it ('' where Path exists).
+procedure SplitExisting(const Path: String; var Existing, Rest: String);
+begin
+  Existing := RemoveBackslashUnlessRoot(Path);
+  Rest := '';
+  while not DirExists(Existing) and (Length(Existing) > 3) do begin
+    if Rest = '' then
+      Rest := ExtractFileName(Existing)
+    else
+      Rest := ExtractFileName(Existing) + '\' + Rest;
+    Existing := ExtractFileDir(Existing);
+  end;
+end;
+
+// Path as Windows resolves it — a short name expanded, a junction, a link or a substituted
+// drive followed — for the part of it that exists, the rest appended as written; a network
+// target comes back as \\server\share. A part Windows cannot open stays as written.
+function Resolved(const Path: String): String;
+var
+  Existing, Rest, Buffer: String;
+  Handle: NativeInt;
+  Count: Cardinal;
+begin
+  SplitExisting(RemoveBackslashUnlessRoot(ExpandFileName(Path)), Existing, Rest);
+  Buffer := Existing;
+  Handle := CreateFile(Existing, 0, ShareAll, 0, OpenExisting, BackupSemantics, 0);
+  if Handle <> -1 then
+    try
+      SetLength(Buffer, 1024);
+      Count := GetFinalPathNameByHandle(Handle, Buffer, 1024, 0);
+      if (Count > 0) and (Count < 1024) then begin
+        SetLength(Buffer, Count);
+        if CompareText(Copy(Buffer, 1, 8), '\\?\UNC\') = 0 then
+          Buffer := '\\' + Copy(Buffer, 9, Length(Buffer))
+        else if Copy(Buffer, 1, 4) = '\\?\' then
+          Buffer := Copy(Buffer, 5, Length(Buffer));
+      end
+      else
+        Buffer := Existing;
+    finally
+      CloseHandle(Handle);
+    end;
+  Result := RemoveBackslashUnlessRoot(Buffer);
+  if Rest <> '' then
+    Result := AddBackslash(Result) + Rest;
+end;
+
+// Why the name beside Path that an update sets a folder aside by is in the way, '' where it is
+// not. An empty folder, or one holding a MirrorHold release — what an earlier setup program
+// left when it could not delete it — is deleted before the install, as an update does; any
+// other is the user's.
+function AsideRefusal(const Path: String): String;
+var
+  Aside: String;
+begin
+  Result := '';
+  Aside := RemoveBackslashUnlessRoot(Path) + AsideSuffix;
+  if FileExists(Aside) or (DirExists(Aside) and HoldsAnything(Aside) and
+     not (FileExists(Aside + '\build.json') and FileExists(Aside + '\MirrorHold.exe'))) then
+    Result := Aside + ' lies beside ' + RemoveBackslashUnlessRoot(Path) + '. An update moves the folder it replaces ' +
+              'to that name and deletes it afterwards, so nothing of yours may be there under that name: move it, ' +
+              'or choose another folder.';
+end;
+
+// Why a first install cannot take Folder, '' where it can. A refused install and the
+// uninstall delete the folder with everything in it, and the jobs' automatic runs start the
+// copy from it, so the folder must hold nothing of the user's and stay reachable; what it is
+// and where it lies are judged on the folder as Windows resolves it. Whether the user can
+// write there is tried last, by making a folder of its own in the nearest folder that exists
+// and removing it.
+function FolderRefusal(const Folder: String): String;
+var
+  Path, Real, Data, Parent, Rest, Probe: String;
+  Waited: Integer;
+begin
+  Result := '';
+  Path := Trim(Folder);
+  StringChangeEx(Path, '/', '\', True);
+  Path := RemoveBackslashUnlessRoot(Path);
+  if (Length(ExtractFileDrive(Path)) <> 2) or (Copy(Path, 3, 1) <> '\') then begin
+    Result := Path + ' is not a full path that starts with a drive letter, such as C:\Apps\MirrorHold.';
+    Exit;
+  end;
+  Path := RemoveBackslashUnlessRoot(ExpandFileName(Path));
+  Real := Resolved(Path);
+  if (Length(Path) <= 3) or (Length(Real) <= 3) then begin
+    Result := Path + ' is the root of a drive. Removing MirrorHold deletes its folder whole, so it needs a folder ' +
+              'of its own.';
+    Exit;
+  end;
+  if (Length(ExtractFileDrive(Real)) <> 2) or (GetDriveType(ExtractFileDrive(Real) + '\') <> DriveFixed) then begin
+    Result := Path + ' is on a drive Windows counts as removable, network or optical. Your jobs'' automatic runs ' +
+              'start MirrorHold from its folder, so it is installed only on a drive Windows counts as fixed.';
+    Exit;
+  end;
+  Data := ExpandConstant('{localappdata}\MirrorHold');
+  if Within(Real, Resolved(Data)) then begin
+    Result := Path + ' lies in ' + Data + ', which keeps your jobs and their records. Removing MirrorHold deletes ' +
+              'its folder whole, so it is installed outside that folder.';
+    Exit;
+  end;
+  if FileExists(Path) then begin
+    Result := Path + ' is a file, not a folder.';
+    Exit;
+  end;
+  if DirExists(Path) and HoldsAnything(Path) then begin
+    Result := Path + ' already holds files or folders. A refused install and removing MirrorHold delete its ' +
+              'folder whole, so it is installed only into a new or an empty folder.';
+    Exit;
+  end;
+  Result := AsideRefusal(Path);
+  if Result <> '' then
+    Exit;
+  SplitExisting(Path, Parent, Rest);
+  Probe := AddBackslash(Parent) + 'MirrorHold setup ' + GetDateTimeString('yyyymmddhhnnss', #0, #0) + ' ' +
+           IntToStr(Random(1000000));
+  if not CreateDir(Probe) then begin
+    Result := 'Setup cannot create a folder in ' + Parent + '. MirrorHold is installed for you alone, without ' +
+              'an administrator''s rights, so it goes only where you can write.';
+    Exit;
+  end;
+  Waited := 0;
+  while not RemoveDir(Probe) and (Waited < Patience) do begin
+    Sleep(500);
+    Waited := Waited + 500;
+  end;
+  if DirExists(Probe) then
+    Log('The folder made to try writing could not be removed: ' + Probe);
+end;
+
+// An update stays in the copy's folder, and a command line naming another is refused. A
+// first install shows the folder page, which refuses a folder it cannot take; a silent one
+// shows none, so the folder it would take, named or not, is tried here.
 function InitializeSetup: Boolean;
 var
-  Own, Requested, Words: String;
+  Default, Requested, Folder, Words: String;
 begin
-  Own := ExpandConstant('{#SetupSetting("DefaultDirName")}');
+  Default := ExpandConstant('{#SetupSetting("DefaultDirName")}');
+  Updating := RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', PreviousLabel);
+  if Updating and not RegQueryStringValue(HKCU, UninstallKey, 'Inno Setup: App Path', PreviousFolder) then
+    PreviousFolder := Default;
   Requested := RequestedFolder;
-  if (Requested <> '') and not SameFolder(Requested, Own) then begin
-    Words := 'MirrorHold is installed into ' + Own + ' alone: every later setup program updates the copy there. ' +
-             'Setup was asked to install it into ' + Requested + ' instead, so nothing was installed.' + #13#10#13#10 +
-             'Run Setup again without choosing a folder (no /DIR=, no winget --location).';
+  Words := '';
+  if Updating then begin
+    if (Requested <> '') and not SameFolder(Requested, PreviousFolder) then
+      Words := 'MirrorHold is installed in ' + PreviousFolder + ', and an update replaces it there: its Start menu ' +
+               'entry and its scheduled tasks start it from that folder. Setup was asked to install it into ' +
+               Requested + ' instead, so nothing was changed.' + #13#10#13#10 +
+               'Run Setup again without choosing a folder (no /DIR=, no winget --location). To move MirrorHold, ' +
+               'remove it from Windows'' list of installed apps first, then install it where you want it.';
+  end
+  else if WizardSilent then begin
+    Folder := Requested;
+    if Folder = '' then
+      Folder := Default;
+    Words := FolderRefusal(Folder);
+    if Words <> '' then
+      Words := 'MirrorHold was not installed, and nothing has changed.' + #13#10#13#10 + Words;
+  end;
+  if Words <> '' then begin
     Log(Words);
     SuppressibleMsgBox(Words, mbError, MB_OK, IDOK);
     Result := False;
     Exit;
   end;
-  Updating := RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', PreviousLabel);
   Result := True;
+end;
+
+// The folder page is left only for a folder a first install can take.
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Words: String;
+begin
+  Result := True;
+  if (CurPageID <> wpSelectDir) or Updating then
+    Exit;
+  Words := FolderRefusal(WizardDirValue);
+  if Words <> '' then begin
+    Log(Words);
+    SuppressibleMsgBox(Words + #13#10#13#10 + 'Choose another folder.', mbError, MB_OK, IDOK);
+    Result := False;
+  end;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
@@ -367,6 +577,13 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  // On a first install the folder page refused a folder of that name holding what is the
+  // user's; one that has appeared since is left alone too.
+  if not Updating then begin
+    Result := AsideRefusal(AppFolder);
+    if Result <> '' then
+      Exit;
+  end;
   if DirExists(AsideFolder) and not DelTree(AsideFolder, True, True, True) then begin
     Result := 'A folder an earlier setup of MirrorHold left behind cannot be removed: ' + AsideFolder +
               '. Delete it, then try again.';

@@ -9,9 +9,18 @@ jobs in the group's order, and then the jobs in no group. A group's status is it
 pressing job's — a job at work, then one needing review, a problem, one needing
 attention, any other word but "Up to date" — named when it is the only one at that
 level ("Phone: Running"), counted when several share its words ("Running (2 jobs)"),
-else named with how many more ("Phone: Running (+1)"); "Up to date" when every job is.
+else named with how many more ("Phone: Running (+1)"); "Up to date" when every job is; a
+job that reads "Switched off" is left out of it, and a group of such jobs alone reads so.
 Its last success is its oldest job's, "never" while any has none: the stalest backup is
 the one the user needs to see.
+
+Each destination has a switch (``mirrorhold.jobs.model.Destination.switched_on``). A
+destination switched off reads "Switched off", in the absent tone, unless an activity is at
+work on it, and asks nothing of the user meanwhile: it is not counted in its job's status,
+nor in its group's, and a job with every destination switched off reads "Switched off" while
+nothing is at work. A job row carries its destinations' switches together (``Switch``: all
+on, some, none), which the window draws before its name. A run of the job whole sees it
+through its destinations switched on (``JobRow.serving``).
 
 Destination status, most specific first: a run in progress that serves it (a run names
 the destinations it serves; one that names none, an older copy's, serves every one),
@@ -102,8 +111,8 @@ from mirrorhold.maintenance.verification import (VerificationMode, VerificationR
 from mirrorhold.planning.listing import Occupancy
 from mirrorhold.records.admission import WaitedFor, line_words, starting
 from mirrorhold.records.diagnostics import ActivityLog
-from mirrorhold.records.record import (FIRST_RUN_REASON, HOLDS_CONTENT_REASON, SHARED_RECORD_LOST, Outcome, RunRecord,
-                                       destination_state)
+from mirrorhold.records.record import (FIRST_RUN_REASON, HOLDS_CONTENT_REASON, LEFT_BY_USER, NEVER_BEGUN, PROCESS_ENDED,
+                                       SHARED_RECORD_LOST, Outcome, RunRecord, destination_state, reached)
 from mirrorhold.records.status import UNREADABLE, ObservedRun, Phase, is_repair, is_run, is_verification, place_of
 from mirrorhold.run.gate import Hold
 from mirrorhold.run.runner import NAMES_AMBIGUOUS, REMOTE_FAILED, SHARED_RECORD_UNREADABLE, SYSTEM_FOLDER_CODE
@@ -141,7 +150,9 @@ _REASON_WORDS = {
     "engine-unusable": "the sync engine cannot be used",
     "engine-failed": "the sync engine failed",
     "unexpected-error": "an unexpected error",
-    "process-ended": "its process ended",
+    PROCESS_ENDED: "its process ended",
+    NEVER_BEGUN: "its process ended before it began",
+    LEFT_BY_USER: "it was paused or stopping, so it is not continued by itself",
     "source-absent": "the source's drive is not attached",
     "destination-absent": "the drive is not attached",
     Hold.SHARE_OF_DESTINATION.value: "too large a share of the destination's files would move into versions",
@@ -194,7 +205,17 @@ class Tone(str, Enum):
     ACTIVE = "active"          # a run in progress or waiting
     ATTENTION = "attention"    # needs the user's review
     PROBLEM = "problem"        # stopped, failed, refused
-    ABSENT = "absent"          # waits for a drive that is not attached, or a remote not reached
+    ABSENT = "absent"          # waits for a drive that is not attached, or a remote not reached; switched off
+
+
+class Switch(str, Enum):
+    """A job's destinations' switches together."""
+    ON = "on"                  # every one switched on
+    SOME = "some"              # some switched on, some off
+    OFF = "off"                # every one switched off
+
+
+SWITCHED_OFF = "Switched off"
 
 
 @dataclass(frozen=True)
@@ -250,6 +271,7 @@ class DestinationRow:
     found_differ: Optional[VerificationRecord] = None   # its latest finished pass, when that found copies that differ
     repairing: bool = False          # a repair of it is in progress
     can_repair: bool = False         # a repair of the copies its latest finished pass found to differ can start now
+    switched_on: bool = True         # its switch (``Destination.switched_on``)
 
     @property
     def iid(self) -> str:
@@ -304,6 +326,7 @@ class JobRow:
     running: bool = False
     last_success_raw: Optional[str] = None   # its newest destination's last success (UTC)
     start_failure: Optional[ActivityLog] = None   # its latest start, when it left no record and nothing came since
+    switch: Switch = Switch.ON               # its destinations' switches together, as stored
 
     @property
     def iid(self) -> str:
@@ -325,10 +348,12 @@ class JobRow:
 
     def serving(self, destinations: Optional[Collection[str]]) -> "JobRow":
         """The job as a run of ``destinations`` (markers) sees it: its rows of those alone,
-        so what it says of first backups and reviews is that run's; itself for None, a run of
-        every destination."""
+        so what it says of first backups and reviews is that run's; for None, a run of the
+        job whole, its rows of the destinations switched on."""
         if destinations is None:
-            return self
+            if self.switch is Switch.ON:
+                return self
+            return replace(self, destinations=tuple(d for d in self.destinations if d.switched_on))
         wanted = set(destinations)
         return replace(self, destinations=tuple(d for d in self.destinations if d.marker_id in wanted))
 
@@ -494,7 +519,8 @@ def _verifying_words(status: dict) -> str:
     share = _live_share(status)
     lead = "Verifying new copies" if (status.get("verify") or {}).get("mode") == VerificationMode.NEW_COPIES.value \
         else "Verifying"
-    return lead + (f" {share} %" if share is not None else "") + (" (paused)" if status.get("paused") else "")
+    paused = status.get("paused") and not status.get("resuming")
+    return lead + (f" {share} %" if share is not None else "") + (" (paused)" if paused else "")
 
 
 def record_share(record: VerificationRecord) -> int:
@@ -552,6 +578,8 @@ def _run_words(status: dict) -> str:
         return waiting_words(status)
     if status.get("cancelling"):
         return "Cancelling"
+    if status.get("resuming"):
+        return "Resuming"
     if status.get("paused"):
         return "Paused"
     return "Running"
@@ -630,7 +658,8 @@ def _destination_row(job: Job, index: int, volumes: Sequence[VolumeInfo],
                   else None,
                   found_differ=found, repairing=repairing is not None,
                   can_repair=(reachable and source_present and marker is MarkerState.MATCH and idle
-                              and found is not None and bool(pending(found, repairs))))
+                              and found is not None and bool(pending(found, repairs))),
+                  switched_on=destination.switched_on)
     number = run_number(live, destination.marker_id, index) if live is not None else None
     finished = {int(i) for i, _ in (live or {}).get("finished") or []}
     if live is not None and number is not None and number not in finished:
@@ -646,6 +675,8 @@ def _destination_row(job: Job, index: int, volumes: Sequence[VolumeInfo],
         else:
             status = REPAIR_WAITING if repairing.get("phase") == Phase.WAITING.value else REPAIRING
         return DestinationRow(status=status, tone=Tone.ACTIVE, **common)
+    if not destination.switched_on:
+        return DestinationRow(status=SWITCHED_OFF, tone=Tone.ABSENT, **common)
     if away:
         return DestinationRow(status=WAITS_REMOTE, tone=Tone.ABSENT, **common)
     if resolution.presence is Presence.AMBIGUOUS:
@@ -804,12 +835,18 @@ def build_rows(contents: StoreContents, volumes: Sequence[VolumeInfo],
                                                live_ids, fixes, repairing.get(job.destinations[i - 1].marker_id))
                              for i in range(1, len(job.destinations) + 1))
         failure = start_failure(by_job.get(job.job_id, ()), history, checks, fixes)
-        status, tone = _job_status(destinations, source, live, failure)
+        counted_rows = tuple(d for d in destinations if d.switched_on or d.tone is Tone.ACTIVE)
+        if counted_rows or live is not None or failure is not None:
+            status, tone = _job_status(counted_rows, source, live, failure)
+        else:
+            status, tone = SWITCHED_OFF, Tone.ABSENT
         successes = [d.last_success_raw for d in destinations if d.last_success_raw]
         last = max(successes) if successes else None
+        on = len(job.switched_on)
+        switch = Switch.ON if on == len(job.destinations) else Switch.OFF if not on else Switch.SOME
         rows.append(JobRow(job.job_id, job.name, describe_folder(source), _drive_words(source.presence),
                            local_time(last), status, tone, destinations, running=live is not None,
-                           last_success_raw=last, start_failure=failure))
+                           last_success_raw=last, start_failure=failure, switch=switch))
     return tuple(rows)
 
 
@@ -831,10 +868,13 @@ def _group_row(group: Group, jobs: Tuple[JobRow, ...]) -> GroupRow:
         return GroupRow(group.group_id, group.name, jobs, "", "No jobs", Tone.NORMAL)
     successes = [j.last_success_raw for j in jobs]
     last = local_time(None if None in successes else min(successes))
-    level = max(_pressing(j) for j in jobs)
+    counted_jobs = [j for j in jobs if j.status != SWITCHED_OFF]
+    if not counted_jobs:
+        return GroupRow(group.group_id, group.name, jobs, last, SWITCHED_OFF, Tone.ABSENT)
+    level = max(_pressing(j) for j in counted_jobs)
     if level == 0:
         return GroupRow(group.group_id, group.name, jobs, last, UP_TO_DATE, Tone.NORMAL)
-    at_level = [j for j in jobs if _pressing(j) == level]
+    at_level = [j for j in counted_jobs if _pressing(j) == level]
     first = at_level[0]
     if len(at_level) == 1:
         status = f"{first.name}: {first.status}"
@@ -907,6 +947,8 @@ def job_has_run(records: Sequence[RunRecord]) -> bool:
     """Whether a run of the job may have written to a destination: its source is then
     fixed, because a new source would make the next run replace what is there."""
     for r in records:
+        if not reached(r):
+            continue
         if r.outcome in (Outcome.COMPLETED, Outcome.CANCELLED, Outcome.INTERRUPTED):
             return True
         if r.outcome is Outcome.HELD and FIRST_RUN_REASON not in r.reasons:

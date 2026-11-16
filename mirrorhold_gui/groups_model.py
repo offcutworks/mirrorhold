@@ -15,10 +15,19 @@ there decides what the window offers (``Selection``):
 whose group's row is selected runs whole, and a job reached only through rows of its
 destinations runs those destinations alone — so a destination selected is run, never its
 job's others. A run of some destinations sees the job through them (``JobRow.serving``):
-the first backups it confirms and the reviews it holds are theirs.
+the first backups it confirms and the reviews it holds are theirs. A job run whole —
+its own row or its group's selected — runs its destinations switched on
+(``mirrorhold.jobs.model.Destination.switched_on``), and one with none is left out
+(``Selection.switched_off``), while a destination selected itself runs whatever its switch
+(the maintainer's decision, 2026-11-11). *Verify...* is not affected by the switches.
+Switching some destinations — a click on a dot, Space, the menu's *Switched on* — switches
+them all one way (``switching_on``) and changes those destinations alone, saving nothing
+when every one already reads as asked (``switched``). The selection's right-click menu
+opens from the keyboard too, under a row of the selection (``keyboard_menu``).
 
 Running several jobs asks once first (``run_several``): which start, and of a job run
-for some destinations which, which run already and are left alone, which first backups
+for some destinations which, which run already and are left alone, what is switched off
+and left out, which first backups
 into folders that hold nothing yet the answer confirms, and which need the user's review
 — their run holds what waits for a confirmation, as *Run now* on one job does. They
 start together and are admitted like any run: those that conflict wait their turn, and
@@ -45,8 +54,8 @@ Which groups the user closed in the list is the GUI's own remembered state
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Collection, Dict, Mapping, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Collection, Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from mirrorhold.contract_errors import ContractError
 from mirrorhold.endpoints.marker import MarkerState
@@ -55,7 +64,7 @@ from mirrorhold.jobs.store import StoreContents
 from mirrorhold.wording import agreeing, counted
 
 from .formatting import joined
-from .jobs_model import DestinationRow, GroupRow, JobRow
+from .jobs_model import DestinationRow, GroupRow, JobRow, Switch
 from .verify_model import GIVES_WAY
 
 COLLAPSED_KEY = "collapsed_groups"
@@ -66,6 +75,12 @@ NEW_GROUP_NOTE = "Right-click jobs to move them into a group."
 SHOWN_NAMES = 10
 
 
+def _whole(items: Sequence[object]) -> Set[str]:
+    """The jobs the selected rows run whole: those whose own row or group's row is among them."""
+    whole = {job.job_id for item in items if isinstance(item, GroupRow) for job in item.jobs}
+    return whole | {item.job_id for item in items if isinstance(item, JobRow)}
+
+
 @dataclass(frozen=True)
 class Selection:
     """What is selected in the job list, in the list's order, every job it reaches, and
@@ -74,6 +89,7 @@ class Selection:
     items: Tuple[object, ...] = ()
     reached: Tuple[JobRow, ...] = ()
     destinations: Tuple[DestinationRow, ...] = ()   # a selected destination; a selected job's or group's every one
+    switched_off: Tuple[JobRow, ...] = ()           # run whole, with every destination switched off
 
     @classmethod
     def of(cls, items: Sequence[object], by_iid: Mapping[str, object]) -> "Selection":
@@ -98,7 +114,9 @@ class Selection:
                 targets.setdefault(row.iid, row)
         order = {iid: n for n, iid in enumerate(by_iid)}
         destinations = tuple(sorted(targets.values(), key=lambda d: order.get(d.iid, len(order))))
-        return cls(tuple(items), tuple(reached.values()), destinations)
+        whole = _whole(items)
+        off = tuple(job for job in reached.values() if job.job_id in whole and job.switch is Switch.OFF)
+        return cls(tuple(items), tuple(reached.values()), destinations, off)
 
     @property
     def single_group(self) -> Optional[GroupRow]:
@@ -118,9 +136,16 @@ class Selection:
         return None
 
     @property
+    def runnable(self) -> Tuple[JobRow, ...]:
+        """The jobs *Run now* runs: every job reached but those run whole with every
+        destination switched off."""
+        off = {job.job_id for job in self.switched_off}
+        return tuple(job for job in self.reached if job.job_id not in off)
+
+    @property
     def startable(self) -> Tuple[JobRow, ...]:
-        """The jobs *Run now* starts: every job reached that is not running."""
-        return tuple(job for job in self.reached if not job.running)
+        """The jobs *Run now* starts: every job it runs that is not running."""
+        return tuple(job for job in self.runnable if not job.running)
 
     @property
     def chosen(self) -> Dict[str, Tuple[str, ...]]:
@@ -128,8 +153,7 @@ class Selection:
         destinations, by job: their markers, in the job's order — the destination itself,
         whatever number the job gives it when the run starts. A job whose own row or whose
         group's row is selected is not here: it runs whole."""
-        whole = {job.job_id for item in self.items if isinstance(item, GroupRow) for job in item.jobs}
-        whole |= {item.job_id for item in self.items if isinstance(item, JobRow)}
+        whole = _whole(self.items)
         chosen: Dict[str, Tuple[str, ...]] = {}
         for destination in self.destinations:
             if destination.job_id not in whole:
@@ -169,6 +193,53 @@ def reordered(contents: StoreContents, selection: Selection, step: int) -> Optio
     except ContractError:
         pass
     return None
+
+
+def keyboard_menu(focus: str, selected: Sequence[str],
+                  ancestors: Callable[[str], Sequence[Tuple[str, bool]]]) -> Optional[Tuple[Optional[str], str]]:
+    """Where Shift+F10 or the Menu key opens the selection's menu, as (the row to select
+    first, the row it opens under); None with nothing selected or focused. ``focus`` and
+    ``selected`` are row identifiers, '' for no focus; ``ancestors(row)``: the row's
+    parents, innermost first, each with whether it is open. The menu is the selection's,
+    so it opens under the focused row where that is selected and the first selected
+    otherwise; with nothing selected the focused row is selected first, as a right-click
+    selects the row it is on. A row inside a closed group opens it under the outermost
+    closed parent, which the list shows, rather than opening the group."""
+    if not selected:
+        if not focus:
+            return None
+        row, select = focus, focus
+    else:
+        row, select = (focus if focus in selected else selected[0]), None
+    under = row
+    for parent, is_open in ancestors(row):
+        if not is_open:
+            under = parent
+    return select, under
+
+
+def switching_on(rows: Sequence[DestinationRow]) -> bool:
+    """Whether switching the destinations ``rows`` switches them on: unless every one is on.
+    A click on a job's dot, Space and the menu's *Switched on* all switch this way."""
+    return not all(row.switched_on for row in rows)
+
+
+def switched(contents: StoreContents, rows: Sequence[DestinationRow], on: bool) -> Optional[StoreContents]:
+    """The job file with the destinations ``rows`` show switched ``on`` and every other
+    destination as it is; None when there is nothing to save — every one already reads as
+    asked, or none of their jobs is in the file any more. A destination is found by its
+    marker within its job, never by its number, which an edit elsewhere may have moved."""
+    markers: Dict[str, Set[str]] = {}
+    for row in rows:
+        markers.setdefault(row.job_id, set()).add(row.marker_id)
+    changed = contents
+    for job_id, wanted in markers.items():
+        job = changed.job(job_id)
+        if job is None or all(d.switched_on == on for d in job.destinations if d.marker_id in wanted):
+            continue
+        destinations = tuple(replace(d, switched_on=on) if d.marker_id in wanted else d for d in job.destinations)
+        changed = changed.with_job(replace(job, destinations=destinations))
+    return None if changed is contents else changed
 
 
 def _names_of(names: Sequence[str]) -> str:
@@ -219,8 +290,9 @@ def _on_one_drive(turns: DriveTurns, what: str) -> str:
 
 def _run_name(job: JobRow, chosen: Mapping[str, Tuple[str, ...]]) -> str:
     """'Photos', 'Recipes (destination 4)', 'Recipes (destinations 2 and 3)': a job as the question
-    names what starts of it, ``job`` as the run sees it (``JobRow.serving``)."""
-    if job.job_id not in chosen:
+    names what starts of it, ``job`` as the run sees it (``JobRow.serving``) — whole, its
+    destinations named only while some are switched off."""
+    if job.job_id not in chosen and job.switch is not Switch.SOME:
         return job.name
     indexes = [d.index for d in job.destinations]
     which = ("destination " if len(indexes) == 1 else "destinations ") + joined([str(i) for i in indexes])
@@ -229,12 +301,19 @@ def _run_name(job: JobRow, chosen: Mapping[str, Tuple[str, ...]]) -> str:
 
 def run_several(jobs: Sequence[JobRow], group: Optional[str] = None, *,
                 turns: DriveTurns = DriveTurns.AUTOMATIC,
-                chosen: Optional[Mapping[str, Tuple[str, ...]]] = None) -> RunSeveral:
-    """``jobs``: every job reached, in the list's order; ``group``: the group's name when
-    one group is selected; ``turns``: the preference for activities on one drive, which
-    decides what the question says of jobs sharing one; ``chosen``: the destinations run of
-    each job run for some (``Selection.chosen``), every other job running whole."""
+                chosen: Optional[Mapping[str, Tuple[str, ...]]] = None,
+                switched_off: Sequence[JobRow] = ()) -> RunSeveral:
+    """``jobs``: every job run (``Selection.runnable``), in the list's order; ``group``: the
+    group's name when one group is selected; ``turns``: the preference for activities on one
+    drive, which decides what the question says of jobs sharing one; ``chosen``: the
+    destinations run of each job run for some (``Selection.chosen``), every other job running
+    whole; ``switched_off``: the jobs left out because every destination of theirs is switched
+    off (``Selection.switched_off``). The question names those, and the destinations switched
+    off of each job it starts whole, as 'Camera 2'."""
     chosen = chosen or {}
+    left = [job.name for job in switched_off]
+    left += [f"{job.name} {d.index}" for job in jobs if not job.running and job.job_id not in chosen
+             for d in job.destinations if not d.switched_on]
     jobs = [job.serving(chosen.get(job.job_id)) for job in jobs]
     start = [job for job in jobs if not job.running]
     running = [job for job in jobs if job.running]
@@ -244,6 +323,8 @@ def run_several(jobs: Sequence[JobRow], group: Optional[str] = None, *,
     lines = [f"Starts: {_names_of([_run_name(job, chosen) for job in start])}."]
     if running:
         lines.append(f"Running already, not started again: {_names(running)}.")
+    if left:
+        lines.append(f"Switched off, not run: {_names_of(left)}.")
     if firsts:
         lines.append(f"First backups, into folders that hold nothing yet: {_first_backups(firsts)}. "
                      "Starting confirms them.")

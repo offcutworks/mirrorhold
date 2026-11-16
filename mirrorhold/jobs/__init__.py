@@ -71,13 +71,14 @@ Caveats
 - The rules that span groups and jobs — a job in at most one group, every member a
   stored job, no two groups of one name — are checked whenever store contents are built,
   so a file breaking one is corrupt; removing a job removes it from its group.
-- A job file of schema 9 (a drive may be marked a cloud drive), and an export of schema 9
-  though its content did not change, are refused by a copy of the tool that reads an
-  earlier schema — left untouched, never moved aside: an installed copy built before it
-  stops running jobs until it is installed again. The step from 8 changes nothing, every
-  earlier mark being a hard disk's or a solid-state drive's. Schema 8 lets a schedule run
-  monthly, at several times a day or every N hours; the step from 7 changes nothing, the
-  daily and weekly schedules keeping their text. Schema 7 lets
+- A job file of schema 10 (each destination has a switch, where earlier schemas kept one
+  for the job), and an export of schema 10, are refused by a copy of the tool that reads
+  an earlier schema — left untouched, never moved aside: an installed copy built before it
+  stops running jobs until it is installed again. The step from 9 gives each destination
+  its job's switch. Schema 9 lets a drive be marked a cloud drive; the step from 8 changes
+  nothing, every earlier mark being a hard disk's or a solid-state drive's. Schema 8 lets
+  a schedule run monthly, at several times a day or every N hours; the step from 7
+  changes nothing, the daily and weekly schedules keeping their text. Schema 7 lets
   a destination be a remote's folder and has the preferences name the rclone
   configuration; a drive's destination is written as it was in schema 6, so the step from
   6 only adds the preferences' remotes, none named. Schema 4's one at a time on a drive,

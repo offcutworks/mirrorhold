@@ -23,8 +23,9 @@ Structure
                 facts validation judges by — and the capability floor a remote must meet.
     reach.py    The configuration as the engine is handed it, a session opened on it, and a
                 look at one remote folder: reached, unreachable or refused, with why; a
-                session kept for a run's, a preview's, a verification's or a repair's
-                length (``Reached``), which serves each remote folder it reached as storage.
+                session kept for a preview's, a verification's or a repair's length, or
+                for a run's work on one remote destination (``Reached``), which serves each
+                remote folder it reached as storage.
 
 Architecture
 ------------

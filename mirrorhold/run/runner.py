@@ -1,15 +1,15 @@
-"""Running and previewing a job: every selected pair, one after another.
+"""Running and previewing a job: every selected pair, one at a time.
 
 ``run_job`` is what the command line's ``run`` executes, in a core process of its own
 whoever asked for it. It publishes a live status from the moment it starts and waits
 for its turn (``records.admission``): it works at the same time as every run and
 verification it does not conflict with, and claims, from one snapshot of the
-configuration and one scan of the volumes taken as it is admitted, its source and the
-selected destinations present then, and the drives they lie on — taking turns on those the
-user's choice and each drive's kind say to. Destinations asked for — by number, in the job
-as it stood when the run began, or by marker — are kept by marker: a job reordered while the
-run waits changes nothing of which it serves, and one of them removed meanwhile stops the
-run. Admitted, it
+configuration and one scan of the volumes taken as it is first admitted, its source and
+the selected destinations present then — and the drives of its source and of the one
+destination it works on, taking turns on those the user's choice and each drive's kind say
+to. Destinations asked for — by number, in the job as it stood when the run began, or by
+marker — are kept by marker: a job reordered while the run waits changes nothing of which it
+serves, and one of them removed meanwhile stops the run. Admitted, it
 works with that configuration — the job re-validated against it — and those volumes;
 removes any volume snapshot a run that died left; decides how the source is read — from
 a volume snapshot made for this run, or as it is (``snapshots.reading``) — lists the
@@ -22,10 +22,28 @@ still have to write there counted as used, under the admission lock — applies 
 gate allows, and writes the pair's record. Pairs are independent: an absent, stopped or
 failed pair does not stop the next one; a cancel does.
 
-A destination that is a remote's folder is reached through one engine session the run
-opens once it is admitted, and a preview once it starts (``remotes.reach``), kept until it
-ends, so an encrypted configuration is unlocked once; the job is validated with what the
-engine said of each selected remote folder. A remote that cannot be reached is recorded
+**One destination at a time** (the maintainer's decision of 2026-11-10). The run is first
+admitted on the first destination asked for, by number, that nothing holds back, and lists
+the source under that turn. Each destination done, it gives up everything and asks again
+for the others in the same moment (``admission.admit``'s ``any_of``): admitted on the first
+of them nothing holds back, it works there, and a held one waits for a later turn, so its
+destinations need not finish in their order; while every one is held back it waits, its
+status saying so as a waiting run's does, its pair cleared. A destination needing no turn
+— a drive not attached as the run was first admitted, or every one once the source could
+not be read — is recorded at once. Between two turns it reads the job file's choices
+again, as every attempt does, and keeps the job, the volumes and the source's listing it
+was first admitted with; an unattended run that has begun is not ended because its job
+stopped running by itself meanwhile.
+
+A destination that is a remote's folder is reached through an engine session the run
+opens for it once admitted there, closed when it is done there, and a preview through one it
+opens as it starts and keeps until it ends (``remotes.reach``); the job is validated with
+what the engine said of that remote folder. A run first admitted on a remote destination —
+as one with no drive destination present always is — asks the engine about every selected
+remote folder through that first session before it lists the source, so the source is read
+from a snapshot only when a drive or a reached remote is there to copy to. Every copy onto a remote starts an engine
+of its own that unlocks an encrypted configuration again, so a session reopened for the
+next remote destination asks nothing a copy does not. A remote that cannot be reached is recorded
 absent and waits (``remote-unreachable``), like a drive not attached; one the validation
 refuses — no configuration, one that cannot be opened or unlocked, a service that refused,
 no such remote, a file in the folder's place, below the capability floor — stops untouched
@@ -123,7 +141,7 @@ from ..endpoints.system import system_folder_endpoints
 from ..endpoints.volumes import VolumeInfo, VolumeSource
 from ..engine.rclone import Engine, EngineError, open_engine, open_source_file
 from ..jobs.exclusions import EntryFilter
-from ..jobs.model import Destination, Job
+from ..jobs.model import Activities, Destination, Job, Preferences
 from ..jobs.store import ConfigStore, LoadStatus, StoreBusy, StoreContents
 from ..jobs.validation import (DESTINATION_IN_CLOUD_COPY, REMOTE_UNREACHABLE, Contained, Finding, Severity,
                                ValidationContext, ValidationReport, contained_folders, preview_notices,
@@ -140,7 +158,7 @@ from ..power import Hold, System, run_reason
 from ..remotes.facts import Reach, RemoteSetup
 from ..remotes.reach import Reached, reach
 from ..records import diagnostics
-from ..records.admission import ADMISSION_INTERVAL, PUBLISH_PATIENCE, activity_claim, admit
+from ..records.admission import ADMISSION_INTERVAL, PUBLISH_PATIENCE, Claim, activity_claim, admit, worked_on
 from ..records.lock import holding
 from ..records.record import (DONE_KEYS, LEFT_KEYS, PLANNED_KEYS, SHARED_RECORD_LOST, Outcome, RunRecord, SourceRead,
                               capped, last_counted, read_records, throughputs, unbacked_streaks, utc_now,
@@ -232,7 +250,8 @@ class RunOptions:
 class JobRunResult:
     run_id: str
     records: Tuple[RunRecord, ...] = ()
-    disabled: bool = False                            # an unattended run of a disabled job did nothing
+    disabled: bool = False                            # an unattended run found every destination it would
+                                                      # serve switched off, and did nothing
 
 
 @dataclass(frozen=True)
@@ -328,13 +347,17 @@ def _job(contents: StoreContents, job_id: str) -> Job:
     return job
 
 
+ALL_SWITCHED_OFF = "every destination of the job is switched off; name the destinations to run"
+
+
 def _selected(job: Job, wanted: Optional[Sequence[int]], markers: Optional[Sequence[str]] = None) -> List[int]:
     """The numbers of the destinations asked for — by number or by marker, in the job as it
-    stands — or of every one when neither is given."""
+    stands, whatever their switches — or of every one switched on when neither is given,
+    which may be none."""
     if wanted is not None and markers is not None:
         raise RunError("destinations are named by number or by marker, not both")
     if wanted is None and markers is None:
-        return list(range(1, len(job.destinations) + 1))
+        return list(job.switched_on)
     try:
         numbers = ([job.destination_number(marker=marker) for marker in markers] if markers is not None
                    else [job.destination_number(n) for n in wanted])
@@ -343,10 +366,28 @@ def _selected(job: Job, wanted: Optional[Sequence[int]], markers: Optional[Seque
     return sorted(set(numbers))
 
 
+def _serving(job: Job, numbers: Sequence[int], unattended: bool) -> List[int]:
+    """``numbers`` as a run serves them: all of them, but never a destination switched off
+    for an unattended run. Judged as a run starts and again at its first turn, as the job
+    then stands."""
+    return [n for n in numbers if not unattended or job.destinations[n - 1].switched_on]
+
+
 def _markers(job: Job) -> List[str]:
     """The markers of the job's destinations, destination 1 first: what each number a run's
     status gives names, whatever the job's order becomes while the run works."""
     return [destination.marker_id for destination in job.destinations]
+
+
+def _claims(job: Job, remaining: Sequence[int], volumes: Sequence[VolumeInfo],
+            activities: Activities) -> Tuple[Claim, Tuple[Claim, ...], Tuple[int, ...]]:
+    """What a run asks for among the destinations ``remaining`` (1-based) it has not
+    finished: all of them, which it claims while it waits; a claim working on each it works
+    on at a turn (``admission.worked_on``), in their order, to be admitted on the first
+    nothing holds back (``admission.admit``'s ``any_of``); and the destinations those are of."""
+    offered = tuple(i for i in remaining if worked_on(job.destinations[i - 1], volumes))
+    parts = tuple(activity_claim(job, remaining, volumes, activities, working=i) for i in offered)
+    return activity_claim(job, remaining, volumes, activities), parts, offered
 
 
 def _refused(report: ValidationReport, subject: str) -> Tuple[Finding, ...]:
@@ -742,7 +783,7 @@ def preview_job(store: ConfigStore, job_id: str, *, volume_source: VolumeSource,
     """What a run of the job would do now. Changes nothing but the job's ticket.
 
     ``destinations`` names the destinations to preview by number, ``markers`` by marker,
-    either found in the job as this preview reads it; neither, every one.
+    either found in the job as this preview reads it; neither, every one switched on.
     ``content``: what each first run onto what the source does not hold does with it,
     where both are offered; its ticket confirms that, and ``ticket_for`` the other.
     ``progress`` is told where the preview is; an exception it raises ends the preview
@@ -751,6 +792,8 @@ def preview_job(store: ConfigStore, job_id: str, *, volume_source: VolumeSource,
     contents = _load(store)
     job = _job(contents, job_id)
     indexes = _selected(job, destinations, markers)
+    if not indexes:
+        raise RunError(ALL_SWITCHED_OFF)
     volumes = volume_source.scan().volumes
     remote = [d.remote for d in job.destinations if d.remote is not None]   # validation judges every destination
     remotes = reach(contents.preferences, store.path, remote) if remote else None
@@ -947,7 +990,7 @@ class _Run:
         self.status = LiveStatus(self.run_id, os.getpid(), job.job_id, job.name, self.trigger, utc_now(),
                                  pair_total=len(indexes), selected=list(indexes), markers=_markers(job))
         self.board = StatusBoard(self.layout, self.status)
-        self.control = RunControl(self.status)
+        self.control = RunControl(self.status, self.board)
         self.hold = Hold(run_reason(job.name), lambda: self.status.admitted and not self.status.paused,
                          lambda: _load(store).preferences.activities, system=power)
         self.pump = StatusPump(self.board, self.control, on_tick=self.hold.tick)
@@ -957,7 +1000,9 @@ class _Run:
         self.notes: List[str] = []              # told once, in the first record this run writes
         self.engine: Optional[Engine] = None
         self.volume_source: Optional[VolumeSource] = None
-        self.remotes: Optional[Reached] = None  # the session the selected remote destinations are reached through
+        self.preferences: Optional[Preferences] = None   # the job file's, as the run's latest attempt at its turn read them
+        self.remotes: Optional[Reached] = None  # the session of the remote destination the run works on, while it does
+        self.not_begun = "cancelled before it started"   # what the records say of a run that ends waiting
 
     # --- records -----------------------------------------------------------------
 
@@ -1092,10 +1137,9 @@ class _Run:
     def _execute(self, sync_roots: Sequence[SyncRoot]) -> None:
         admitted = self._admit(self.volume_source)
         if admitted is None:
-            self.record_rest(self.indexes, Outcome.CANCELLED, ("cancelled-while-waiting",),
-                             "cancelled before it started")
+            self.record_rest(self.indexes, Outcome.CANCELLED, ("cancelled-while-waiting",), self.not_begun)
             return
-        contents, volumes = admitted
+        contents, volumes, held = admitted
         self.status.phase, self.status.listed = Phase.LISTING, 0
         self.notes = remove_leftovers(self.layout, self.snapshot.provider, current_run=self.run_id)
         for note in self.notes:
@@ -1107,16 +1151,22 @@ class _Run:
                 ticket = load_ticket(self.layout, self.job.job_id, self.options.ticket_id)
             except TicketError as exc:
                 raise RunError(str(exc)) from None
-        self._pairs(contents, volumes, sync_roots, ticket)
+        self._pairs(contents, volumes, sync_roots, ticket, held)
         if ticket is not None:
             discard_ticket(self.layout, self.job.job_id, ticket.ticket_id)
 
-    def _admit(self, volume_source: VolumeSource) -> Optional[Tuple[StoreContents, Tuple[VolumeInfo, ...]]]:
-        """Wait for this run's turn (``records.admission``). The store and the volumes as they
-        are at the attempt that admits it are what the run claims and works with — the
-        drives it takes turns on as the store's preferences and their kinds say, and what it asks of
-        the computer while it works. None when it is cancelled while it waits. A job file
-        another program holds is read again at the next attempt."""
+    def _admit(self, volume_source: VolumeSource) -> Optional[Tuple[StoreContents, Tuple[VolumeInfo, ...],
+                                                                     Optional[int]]]:
+        """Wait for this run's first turn (``records.admission``), on the first destination
+        asked for, by number, that nothing holds back (``_claims``), or on its source alone
+        when it has none to work on. The store and the volumes as they are at the attempt that
+        admits it are what the run claims and works with — the drives it takes turns on as the
+        store's preferences and their kinds say, and what it asks of the computer while it
+        works — with the destination it was admitted on, None for its source alone. None when
+        it is cancelled while it waits, is unattended and the job no longer runs by itself, or
+        finds every destination it would serve switched off (``_indexes_in``), each judged at
+        each attempt as at its start; its claim is then withdrawn
+        (``_withdraw``). A job file another program holds is read again at the next attempt."""
         while self.control.cancel is None:
             try:
                 contents = _load(self.store)
@@ -1126,27 +1176,71 @@ class _Run:
             job = contents.job(self.job.job_id)
             if job is None:
                 raise RunError("the job was removed while this run waited")
+            why_not = job.not_automatic(self.options.automatic) if self.options.unattended else ""
+            if why_not:
+                self.not_begun = f"{why_not} now"
+                break
             indexes = self._indexes_in(job)
+            if not indexes:
+                self.not_begun = "every destination it would serve is switched off now"
+                break
             volumes = tuple(volume_source.scan().volumes)
-            claim = activity_claim(job, indexes, volumes, contents.preferences.activities)
-            if admit(self.board, claim).admitted:
+            claim, parts, offered = _claims(job, indexes, volumes, contents.preferences.activities)
+            turn = admit(self.board, claim, any_of=parts)
+            if turn.admitted:
                 self.job, self.indexes, self.status.pair_total = job, indexes, len(indexes)
                 self.status.selected, self.status.markers = list(indexes), _markers(job)
+                self.preferences = contents.preferences
                 self.hold.choose(contents.preferences.activities)
-                return contents, volumes
+                return contents, volumes, offered[turn.chosen] if offered else None
             self.control.wait_change(ADMISSION_INTERVAL)
+        self._withdraw()
         return None
 
+    def _next_turn(self, remaining: Sequence[int], volumes: Sequence[VolumeInfo]) -> Optional[int]:
+        """Done with a destination, give up everything and ask again (``records.admission``):
+        the one of ``remaining`` the run is admitted on, the first by number that nothing holds
+        back; while every one is, it waits, claiming them all, its status saying so as a
+        waiting run's does and naming no destination. It holds nothing from the moment it
+        asks: its status says so before the first attempt, which may wait for the admission
+        lock. The job file's choices are read at each attempt, as at the first — those read
+        last standing while the file cannot be read — and the job and the volumes stay those
+        the run was first admitted with. None when a cancel comes first, its claim withdrawn."""
+        status = self.status
+        status.phase, status.pair_index, status.marker_id, status.pair_started = Phase.WAITING, 0, None, None
+        status.destination, status.listed, status.examined, status.to_examine = "", 0, 0, 0
+        status.planned, status.done = dict.fromkeys(PLANNED_KEYS, 0), dict.fromkeys(DONE_KEYS, 0)
+        status.admitted, status.waiting_for, status.place = False, None, 0
+        while self.control.cancel is None:
+            try:
+                self.preferences = _load(self.store).preferences
+            except (StoreBusy, RunError):
+                pass
+            claim, parts, offered = _claims(self.job, remaining, volumes, self.preferences.activities)
+            turn = admit(self.board, claim, any_of=parts)
+            if turn.admitted:
+                return offered[turn.chosen]
+            self.control.wait_change(ADMISSION_INTERVAL)
+        self._withdraw()
+        return None
+
+    def _withdraw(self) -> None:
+        """A run that stops waiting without a turn asks for nothing more: claiming nothing and
+        holding no turn, it holds no one back while it records why and ends
+        (``admission.before_first_attempt``), whether or not it has begun."""
+        self.status.claim, self.status.admitted = None, False
+
     def _indexes_in(self, job: Job) -> List[int]:
-        """The numbers in ``job`` of the destinations this run serves: every one, or those
-        asked for, found by marker wherever the job's order has put them. RunError when one
-        asked for is no longer in the job."""
+        """The numbers in ``job`` of the destinations this run serves now (``_serving``):
+        every one switched on, or those asked for, found by marker wherever the job's order has
+        put them; empty when switches turned off meanwhile leave none. RunError when one asked
+        for is no longer in the job."""
         if self.chosen is None:
             return _selected(job, None)
         numbers = {destination.marker_id: n for n, destination in enumerate(job.destinations, 1)}
         if any(marker not in numbers for marker in self.chosen):
             raise RunError("a destination this run was asked for was removed from the job while it waited")
-        return sorted(numbers[marker] for marker in self.chosen)
+        return _serving(job, sorted(numbers[marker] for marker in self.chosen), self.options.unattended)
 
     def _release_snapshot(self) -> None:
         if self.snapshot.snapshot is None:
@@ -1168,12 +1262,22 @@ class _Run:
         return read, self.snapshot.root(self.job.source.endpoint.path) or resolution.location
 
     def _copies_to(self, destination: Destination, volumes: Sequence[VolumeInfo]) -> bool:
-        if destination.remote is not None:
-            return self.remotes is not None and self.remotes.storage(destination.remote) is not None
-        return resolve(destination.endpoint, volumes).presence is Presence.PRESENT
+        """Whether the run may copy to ``destination`` as it lists its source. A remote is
+        known once the engine was asked about it, which it is then whenever no drive is: a run
+        with no drive destination present is first admitted on a remote one (``_pairs``). One
+        not asked about lies beside a drive that is there, so it decides nothing."""
+        if destination.remote is None:
+            return resolve(destination.endpoint, volumes).presence is Presence.PRESENT
+        return self.remotes is None or self.remotes.storage(destination.remote) is not None
 
     def _pairs(self, contents: StoreContents, volumes: Sequence[VolumeInfo], sync_roots: Sequence[SyncRoot],
-               ticket: Optional[Ticket]) -> None:
+               ticket: Optional[Ticket], held: Optional[int]) -> None:
+        """The run's pairs once it is first admitted, on ``held`` (None: on its source
+        alone): the source listed under that turn, every destination needing no turn recorded
+        at once, and each of the others worked on at a turn of its own (``_next_turn``). A first
+        turn on a remote destination holds the configuration's turn, so the engine is asked
+        then about every selected remote folder before the source is listed, which decides
+        whether a snapshot is needed (``_copies_to``), and that session serves the first pair."""
         status = self.status
         try:
             self.engine = open_engine(contents.preferences.engine_path)
@@ -1181,25 +1285,35 @@ class _Run:
         except EngineError as exc:
             self.record_rest(self.indexes, Outcome.FAILED, ("engine-unusable",), str(exc))
             return
-        remote = [self.job.destinations[i - 1].remote for i in self.indexes
-                  if self.job.destinations[i - 1].remote is not None]
-        if remote:
-            self.remotes = reach(contents.preferences, self.store.path, remote, engine=self.engine)
-        context = _context(self.job, contents, volumes, sync_roots, self.store.path,
-                           remote_setup=self.remotes.setup if self.remotes is not None else None)
+        if held is not None and self.job.destinations[held - 1].remote is not None:
+            self.remotes = reach(self.preferences, self.store.path,
+                                 [self.job.destinations[i - 1].remote for i in self.indexes
+                                  if self.job.destinations[i - 1].remote is not None], engine=self.engine)
+        context = _context(self.job, contents, volumes, sync_roots, self.store.path)
         report = validate_job(self.job, context, None)
         status.phase, status.listed = Phase.LISTING, 0
         self.say(f"listing the source of '{self.job.name}'")
         source = _assess_source(self.job, volumes, report, self._listed,
                                 reader=lambda resolution: self._read_source(resolution, volumes))
-        for position, index in enumerate(self.indexes):
+        remaining = list(self.indexes)
+        while remaining:
+            free = [i for i in remaining if source.outcome is not None
+                    or not worked_on(self.job.destinations[i - 1], volumes)]
+            if held is None and not free:
+                if self.control.cancel is not None:
+                    break
+                held = self._next_turn(remaining, volumes)
+                if held is None:
+                    break
+            index = free[0] if free else held
             if self.control.checkpoint() is not None:
-                self.record_rest(self.indexes[position:], Outcome.CANCELLED, ("cancelled",), "not started")
-                return
+                break
+            remaining.remove(index)
+            if index == held:
+                held = None
             confirmation = ticket.pairs.get(self.job.destinations[index - 1].marker_id) if ticket else None
             try:
-                self._pair(index, source, volumes, report, confirmation,
-                           protected_folders(self.job, index, context))
+                self._destination(index, contents, source, volumes, sync_roots, report, context, confirmation)
             except KeyboardInterrupt:
                 self.record(index, Outcome.INTERRUPTED, reasons=("interrupted-at-console",),
                             detail="the run was interrupted at the console; the next run converges")
@@ -1207,8 +1321,29 @@ class _Run:
             except Exception as exc:  # a run that fails unexpectedly still leaves a record
                 self.record_unexpected([index], exc, f"destination {index} failed unexpectedly")
             if self.control.cancel is not None:
-                self.record_rest(self.indexes[position + 1:], Outcome.CANCELLED, ("cancelled",), "not started")
-                return
+                break
+        self.record_rest(remaining, Outcome.CANCELLED, ("cancelled",), "not started")
+
+    def _destination(self, index: int, contents: StoreContents, source: _Source, volumes: Sequence[VolumeInfo],
+                     sync_roots: Sequence[SyncRoot], report: ValidationReport, context: ValidationContext,
+                     confirmation: Optional[PairConfirmation]) -> None:
+        """One destination's pair. A remote's folder is reached through a session opened for
+        it — the first turn's, opened as the run began (``_pairs``), or one of its own — and
+        closed once its pair is done, so the run reaches the remotes only while it works on
+        one; the job is validated with what the engine said of it."""
+        remote = self.job.destinations[index - 1].remote
+        try:
+            if remote is not None and source.outcome is None:
+                if self.remotes is None:
+                    self.remotes = reach(self.preferences, self.store.path, [remote], engine=self.engine)
+                context = _context(self.job, contents, volumes, sync_roots, self.store.path,
+                                   remote_setup=self.remotes.setup)
+                report = validate_job(self.job, context, None)
+            self._pair(index, source, volumes, report, confirmation, protected_folders(self.job, index, context))
+        finally:
+            if remote is not None and self.remotes is not None:
+                self.remotes.close()
+                self.remotes = None
 
     def _pair(self, index: int, source: _Source, volumes, report: ValidationReport,
               confirmation: Optional[PairConfirmation], protected: Sequence[Contained]) -> None:
@@ -1305,10 +1440,12 @@ def run_job(store: ConfigStore, job_id: str, options: RunOptions = RunOptions(),
         raise RunError("a run confirms either a preview's ticket or first backups, not both")
     if options.automatic is not None and (options.automatic not in AUTOMATIC_TRIGGERS or not options.unattended):
         raise RunError(f"an automatic run is unattended and started by one of {', '.join(AUTOMATIC_TRIGGERS)}")
-    indexes = _selected(job, options.destinations, options.markers)
+    indexes = _serving(job, _selected(job, options.destinations, options.markers), options.unattended)
     run = _Run(store, job, options, indexes, say or (lambda text: None), snapshots or default_snapshot_provider(),
                power)
-    if options.unattended and not job.enabled:
-        return JobRunResult(run.run_id, (), disabled=True)
+    if not indexes:
+        if options.unattended:
+            return JobRunResult(run.run_id, (), disabled=True)
+        raise RunError(ALL_SWITCHED_OFF)
     run.execute(volume_source, sync_roots)
     return JobRunResult(run.run_id, tuple(run.records))

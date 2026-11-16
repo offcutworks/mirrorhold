@@ -19,8 +19,9 @@ They start an installed copy instead, of one of two kinds:
   with nothing set up again. Removing the setup leaves the folder for the user to delete.
 
 A release's setup program, built beside its zip from the same files (``tools/setup/``),
-makes no third kind: it puts a portable release in ``%LOCALAPPDATA%\\Programs\\MirrorHold`` and
-has it set itself up with ``install``; a newer one replaces the files in that folder, which
+makes no third kind: it puts a portable release in the folder the user chooses
+(``%LOCALAPPDATA%\\Programs\\MirrorHold`` unless they choose another) and has it set itself up
+with ``install``; a newer one replaces the files in that folder, which
 the setup record already names, so nothing is set up again. Its uninstaller asks the copy to
 remove its setup only if it is the one set up (``uninstall`` with ``only_if_here``), then
 deletes the folder, so another copy's setup outlives it. The package knows nothing of the

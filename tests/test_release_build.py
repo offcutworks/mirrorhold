@@ -268,6 +268,69 @@ class SuiteVerdictTest(unittest.TestCase):
             build_release.judge_suite("FAIL: test_one (test_a.ATest.test_one)\n", LEDGER)
 
 
+FLAKY_LEDGER = LEDGER + """
+### `test_d.DTest.test_seldom`
+
+- **tests:** this one test.
+- **commit:** no change caused it.
+- **delta:** flaky-quarantine. Seen red once, beside a busy
+  machine.
+- **disposition:** none
+- **since:** 2026-11-13
+
+### `test_e.ETest.test_after`
+
+- **tests:** this one test.
+- **delta:** a later entry, whose delta carries no mark.
+"""
+
+
+class FlakyMarkTest(unittest.TestCase):
+    SUMMARY = "\n10 tests, 3 failed, 0 skipped\n"
+    RED = ("FAIL: test_one (test_a.ATest.test_one)\n"
+           "FAIL: test_two (test_b.BTest.test_two)\n"
+           "FAIL: test_after (test_e.ETest.test_after)\n")
+
+    def test_an_entry_whose_delta_carries_the_mark_names_its_test_apart(self):
+        self.assertEqual(build_release.flaky_tests(FLAKY_LEDGER), {"test_d.DTest.test_seldom"})
+        self.assertEqual(build_release.ledger_tests(FLAKY_LEDGER),
+                         {"test_a.ATest.test_one", "test_b.BTest.test_two", "test_e.ETest.test_after"})
+        self.assertEqual(build_release.flaky_tests(LEDGER), set())
+
+    def test_a_marked_test_refuses_no_build_whether_it_fails_or_passes(self):
+        passing = build_release.judge_suite(self.RED + self.SUMMARY, FLAKY_LEDGER)
+        self.assertTrue(passing.matches_ledger)
+        self.assertEqual(passing.flaky, ())
+        failing = build_release.judge_suite(self.RED + "FAIL: test_seldom (test_d.DTest.test_seldom)\n" + self.SUMMARY,
+                                            FLAKY_LEDGER)
+        self.assertTrue(failing.matches_ledger)
+        self.assertEqual((failing.unexpected, failing.flaky), ((), ("test_d.DTest.test_seldom",)))
+
+    def test_beside_a_marked_test_any_other_difference_still_refuses_the_build(self):
+        other = build_release.judge_suite("FAIL: test_one (test_a.ATest.test_one)\n"
+                                          "FAIL: test_after (test_e.ETest.test_after)\n"
+                                          "FAIL: test_seldom (test_d.DTest.test_seldom)\n"
+                                          "FAIL: test_new (test_c.CTest.test_new)\n" + self.SUMMARY, FLAKY_LEDGER)
+        self.assertFalse(other.matches_ledger)
+        self.assertEqual((other.unexpected, other.recovered), (("test_c.CTest.test_new",), ("test_b.BTest.test_two",)))
+
+    def test_a_mark_spelled_otherwise_refuses_the_release(self):
+        for delta in ("Flaky-quarantine. Seen red once, beside a busy", "flaky quarantine. Seen red once, beside a busy",
+                      "`flaky-quarantine.` Seen red once, beside a busy"):
+            ledger = FLAKY_LEDGER.replace("flaky-quarantine. Seen red once, beside a busy", delta)
+            with self.subTest(delta=delta), self.assertRaises(build_release.BuildError):
+                build_release.ledger_tests(ledger)
+
+    def test_a_test_recorded_both_as_red_and_as_red_only_sometimes_refuses_the_release(self):
+        ledger = FLAKY_LEDGER + "\n### `test_a.ATest.test_one`\n\n- **delta:** flaky-quarantine. Also seen red once.\n"
+        with self.assertRaises(build_release.BuildError):
+            build_release.judge_suite(self.RED + self.SUMMARY, ledger)
+
+    def test_the_ledger_this_folder_holds_records_no_test_both_ways(self):
+        ledger = (PROJECT / build_release.LEDGER).read_text(encoding="utf-8")
+        self.assertEqual(build_release.ledger_tests(ledger) & build_release.flaky_tests(ledger), set())
+
+
 class ZipTest(TempDirTest):
     def folder(self) -> Path:
         folder = self.tmp / "release"
@@ -735,8 +798,9 @@ class SetupProgramTest(TempDirTest):
 
     def test_the_script_installs_for_the_user_alone_under_one_identity_and_lets_the_program_decide(self):
         script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
-        for directive in ("PrivilegesRequired=lowest", r"DefaultDirName={autopf}\MirrorHold", "DisableDirPage=yes",
-                          "UsePreviousAppDir=no", "DisableProgramGroupPage=yes", "AppName=MirrorHold",
+        # Whether it asks for the folder, and where an update goes, are the folder tests' below.
+        for directive in ("PrivilegesRequired=lowest", r"DefaultDirName={autopf}\MirrorHold",
+                          "DisableProgramGroupPage=yes", "AppName=MirrorHold",
                           "UninstallDisplayName=MirrorHold", "AppPublisher=offcutworks", "AppVersion={#Label}",
                           "CloseApplications=no", "TouchDate={#TouchDate}", "TouchTime=00:00:00",
                           "TimeStampsInUTC=yes", "AppId={{{#AppGuid}}"):
@@ -754,18 +818,85 @@ class SetupProgramTest(TempDirTest):
                 self.assertIn(command, script)
                 cli._parser().parse_args(command.strip("'").split())
 
-    def test_the_script_refuses_any_folder_but_its_own_before_anything_changes(self):
-        # Inno Setup takes a folder named by /DIR= or a /LOADINF= file's Dir with no folder
-        # page shown; the refusal compares either with DefaultDirName at InitializeSetup.
+    def test_the_folder_the_command_line_names_is_read_every_way_it_can_be_named_before_anything_changes(self):
+        # Inno Setup takes a folder named by /DIR= or a /LOADINF= file's Dir, either perhaps
+        # behind expand:, with no folder page shown; InitializeSetup reads it before it refuses
+        # anything, and what it refuses is the tests' below.
         script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
-        start = script.index("function InitializeSetup: Boolean;")
-        initialize = script[start:script.index("\nend;", start)]
-        self.assertIn("Own := ExpandConstant('{#SetupSetting(\"DefaultDirName\")}');", initialize)
-        self.assertIn("not SameFolder(Requested, Own)", initialize)
-        self.assertLess(initialize.index("Result := False;"), initialize.index("RegQueryStringValue"))
+        requested = self._routine(script, "function RequestedFolder: String;")
         for switch in ("'/DIR='", "'/LOADINF='", "'expand:'"):
             with self.subTest(switch=switch):
-                self.assertIn(switch, script)
+                self.assertIn(switch, requested)
+        self.assertIn("GetIniString('Setup', 'Dir', Result, ExpandFileName(Inf))", requested)
+        initialize = self._routine(script, "function InitializeSetup: Boolean;")
+        self.assertLess(initialize.index("Requested := RequestedFolder;"), initialize.index("Result := False;"))
+
+    @staticmethod
+    def _routine(script: str, heading: str) -> str:
+        start = script.index(heading)
+        return script[start:script.index("\nend;", start)]
+
+    def test_a_first_install_shows_the_folder_page_and_an_update_stays_in_the_copys_folder(self):
+        script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
+        for directive in (r"DefaultDirName={autopf}\MirrorHold", "DisableDirPage=auto", "UsePreviousAppDir=yes",
+                          "DirExistsWarning=no", "AllowRootDirectory=no", "AllowNetworkDrive=no", "AllowUNCPath=no"):
+            with self.subTest(directive=directive):
+                self.assertIn(f"\n{directive}\n", script)
+
+    def test_a_first_install_takes_only_a_folder_it_can_delete_whole_and_tries_writing_last(self):
+        # A refused install and the uninstall delete the folder whole; the folder made to try
+        # writing is made only for a folder every other rule has taken.
+        script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
+        refusal = self._routine(script, "function FolderRefusal(const Folder: String): String;")
+        rules = ["StringChangeEx(Path, '/', '\\', True)", "ExtractFileDrive(Path)", "Real := Resolved(Path)",
+                 "Length(Real) <= 3", "<> DriveFixed", "ExpandConstant('{localappdata}\\MirrorHold')",
+                 "Within(Real, Resolved(Data))", "FileExists(Path)", "HoldsAnything(Path)", "AsideRefusal(Path)",
+                 "CreateDir(Probe)", "RemoveDir(Probe)"]
+        places = [refusal.find(rule) for rule in rules]
+        for rule, place in zip(rules, places):
+            with self.subTest(rule=rule):
+                self.assertGreater(place, -1)
+        self.assertEqual(places, sorted(places))
+        self.assertIn("DriveFixed = 3;", script)
+        for function in ("GetDriveTypeW", "GetFinalPathNameByHandleW"):
+            with self.subTest(function=function):
+                self.assertIn(f"external '{function}{{#At}}kernel32.dll stdcall';", script)
+
+    def test_only_a_leftover_of_an_earlier_setup_beside_the_folder_is_deleted(self):
+        # An empty folder under the name an update sets a folder aside by, or one holding a
+        # release, is an earlier setup program's; anything else there refuses a first install.
+        script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
+        aside = self._routine(script, "function AsideRefusal(const Path: String): String;")
+        self.assertIn("FileExists(Aside) or (DirExists(Aside) and HoldsAnything(Aside) and", aside)
+        self.assertIn("not (FileExists(Aside + '\\build.json') and FileExists(Aside + '\\MirrorHold.exe'))", aside)
+
+    def test_the_folder_page_is_left_only_for_a_folder_a_first_install_takes(self):
+        script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
+        page = self._routine(script, "function NextButtonClick(CurPageID: Integer): Boolean;")
+        self.assertIn("if (CurPageID <> wpSelectDir) or Updating then", page)
+        self.assertIn("FolderRefusal(WizardDirValue)", page)
+        self.assertIn("Result := False;", page)
+
+    def test_a_folder_no_page_asks_about_is_refused_at_the_start(self):
+        # An update compares the folder named with the one its list entry records; a silent
+        # first install tries the folder it would take, named or the default.
+        script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
+        initialize = self._routine(script, "function InitializeSetup: Boolean;")
+        self.assertIn("RegQueryStringValue(HKCU, UninstallKey, 'Inno Setup: App Path', PreviousFolder)", initialize)
+        self.assertIn("not SameFolder(Requested, PreviousFolder)", initialize)
+        self.assertIn("else if WizardSilent then", initialize)
+        self.assertIn("Default := ExpandConstant('{#SetupSetting(\"DefaultDirName\")}');", initialize)
+        self.assertIn("Folder := Default;", initialize)
+        self.assertIn("FolderRefusal(Folder)", initialize)
+        self.assertLess(initialize.index("RegQueryStringValue"), initialize.index("Result := False;"))
+        self.assertLess(initialize.index("Result := False;"), initialize.index("Result := True;"))
+
+    def test_a_first_install_never_deletes_a_folder_beside_the_one_it_takes(self):
+        script = (PROJECT / build_release.SETUP_SCRIPT).read_text(encoding="utf-8")
+        prepare = self._routine(script, "function PrepareToInstall(var NeedsRestart: Boolean): String;")
+        guard = prepare.index("Result := AsideRefusal(AppFolder);")
+        self.assertLess(prepare.index("if not Updating then begin"), guard)
+        self.assertLess(guard, prepare.index("DelTree(AsideFolder"))
 
 
 class SharedNamesTest(unittest.TestCase):

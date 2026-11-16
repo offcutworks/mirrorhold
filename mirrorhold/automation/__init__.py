@@ -15,7 +15,8 @@ copy, so an arrival during development never runs half-edited code.
 Structure
 ---------
     tasks.py       TaskSpec and desired_tasks(): the tasks a configuration calls for
-                   (per job ``<job id>-arrival`` and ``<job id>-schedule``), and
+                   (per job ``<job id>-arrival`` and ``<job id>-schedule``, and
+                   ``<job id>-logon`` for a schedule with no arrival), and
                    task_xml(), their Task Scheduler definitions; Launcher (the
                    installed interpreter, folder and store a task starts).
     scheduler.py   Scheduler (the seam) and WindowsScheduler (COM, one folder).
@@ -25,8 +26,8 @@ Structure
     arrival.py     Which of a job's drives arrived: presence kept per job and per
                    session of the computer, the session's boot time, the drives
                    settling after an arrival, and what an arrival runs.
-    automatic.py   run_on_arrival() and run_scheduled(): the command line's
-                   ``automatic`` command, which the tasks start.
+    automatic.py   run_on_arrival(), run_scheduled() and run_at_logon(): the command
+                   line's ``automatic`` command, which the tasks start.
 
 Architecture
 ------------
@@ -35,7 +36,7 @@ jobs and the installed copy that serves the store — the source installation's 
 the portable release whose setup record sits beside the store — and reconciles; nothing
 else registers or removes a task (the GUI, the command line and the installer all call it
 after a change, whichever copy they run in). A task starts ``pythonw -m mirrorhold
---store <store> automatic <job> --by arrival|schedule`` in the installed copy's folder,
+--store <store> automatic <job> --by arrival|schedule|logon`` in the installed copy's folder,
 with its interpreter (``invocation`` composes the command); that process decides what to
 run and runs it in itself, as an unattended run named by its trigger in the status and
 the records, and raises the run's notice.
@@ -56,6 +57,10 @@ Caveats
   before logon are served by the logon trigger.
 - Task Scheduler ignores a second start of a task whose run is going; the arrival
   handler therefore looks again after each run and serves what arrived meanwhile.
+- Task Scheduler counts a start that died as a start, so a schedule's missed-run catch-up
+  does not cover a run a shutdown cut short: a job with a schedule alone has a logon task
+  for that, and an arrival's logon trigger serves a job with both. A run of a job with no
+  automatic runs is taken up by the user; no task watches for it.
 - The tasks live in the ``\\MirrorHold`` folder, and reconciliation removes any
   other task found there.
 - A job edited while its arrival run is going takes effect at the next arrival.

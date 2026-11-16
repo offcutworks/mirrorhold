@@ -13,16 +13,19 @@ Structure
     status.py   LiveStatus and StatusBoard (a run, a verification or a repair publishing
                 its status: its phase, the destinations a run serves, the counts of the
                 step in progress, the files in flight and being compared, its claim
-                and its turn), Wanted and
-                request() (callers asking one to pause, resume or cancel),
+                and its turn), Wanted, request() (callers asking one to pause, resume or
+                cancel) and run_next() (the user moving one to the front of the line),
                 observe_runs(), find_run(), is_live(), reap_interrupted(); line_order(),
                 the one order the window and the command line list activities in;
                 LastRead, what an observer that looks again and again last read of
                 each activity, which names one whose status it cannot read now.
     admission.py  which runs, verifications and repairs work at the same time: Claim
                 (the folders one reads and writes, the drives they lie on with their
-                kinds, and when it takes turns on a drive), conflict(), the order of turns
-                (blockers(), place_in_line()), admit() under the admission lock,
+                kinds, when it takes turns on a drive and whether it reaches a remote
+                now), conflict(), the order of turns (blockers(), place_in_line(), a run
+                that has begun first), admit() (a run on the first of its destinations
+                nothing holds back) and take_back() (a paused one
+                working again) under the admission lock, settle_interrupted(),
                 gives_way() for a verification, WaitedFor (what a waiting one names:
                 the activity, whether its status could be read, and the drive they share
                 when that alone is why); starting(), whether a waiting one is starting.
@@ -69,14 +72,24 @@ Design patterns
 - Wanted state, not commands: a control file holds what callers want, so repeated
   and concurrent requests compose; requests to one run take turns under a lock of their
   own (``<run>.request``), so two made at one instant each keep the other's change.
-- Claim everything at once, in a strict order: an activity holds all it claimed from its
-  admission to its end and waits behind every conflicting one that goes first, so no
-  two can each hold part of what the other needs and none waits for ever.
+- Claim at once, in a strict order: an activity holds all it claimed from its admission
+  to its end — a run, to the end of the destination it works on — and waits, holding
+  nothing, behind every conflicting one that goes first, so no two can each hold part of
+  what the other needs and none waits for ever. A run holds only the drives of its source
+  and of that destination, keeping its other destinations' folders; between two it gives
+  everything up and asks again, going before every activity that has not begun. A pause
+  lets the drives go, which nobody needs while it lasts, and they are taken back before it
+  ends.
 
 Caveats
 -------
 - A run killed outright leaves its status files until the next run reaps them; until
-  then ``observe_runs`` reports it as not alive.
+  then ``observe_runs`` reports it as not alive. A run that was working on no destination,
+  one waiting for its turn above all — its first, or one between two of its destinations —
+  is then recorded interrupted for each destination it was to serve and had not finished,
+  as having written nothing there (``NEVER_BEGUN``).
+- A record says when the user had paused a dead run or asked it to stop (``LEFT_BY_USER``):
+  such a run is not continued by itself (``record.cut_short``).
 - Records list skipped files and errors up to ``MAX_LISTED``; the totals are complete.
   The files left unbacked-up are counted from their own list, also up to
   ``MAX_LISTED``, so a run that skips many cloud-only files still counts every file it

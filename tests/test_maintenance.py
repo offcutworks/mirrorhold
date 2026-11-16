@@ -604,6 +604,26 @@ class VerifyTest(VerifyCase):
         record = box["record"]
         self.assertEqual((record.state, record.compared_files, record.sittings), (VerificationState.COMPLETED, 10, 1))
 
+    def test_paused_it_frees_its_drives_and_a_resume_waits_for_them(self):
+        thread, box = self.in_background(**self.slowly(10, 1024 * 1024))
+        status = self.wait(lambda: (s := self.live_status()) and s.get("phase") == Phase.VERIFYING.value and s)
+        request(self.layout, status["run_id"], pause=True)
+        self.wait(lambda: (s := self.live_status()) and s.get("paused"))
+        run = self.on_its_drives(self.d)                           # admitted beside it: nothing holds that drive
+        try:
+            request(self.layout, status["run_id"], pause=False)
+            resuming = self.wait(lambda: (s := self.live_status()) and s.get("resuming") and s)
+            self.assertTrue(resuming["paused"])
+            self.assertEqual(WaitedFor.from_status(resuming), WaitedFor(run.status.run_id, "run", "Other",
+                                                                        drive="drive 'D'"))
+        finally:
+            run.close()
+            self.slow.clear()
+        thread.join(60)
+        self.assertNotIn("error", box)
+        record = box["record"]
+        self.assertEqual((record.state, record.compared_files, record.sittings), (VerificationState.COMPLETED, 10, 1))
+
     def test_it_cannot_start_without_its_pair(self):
         self.mirror({"a.txt": "a"})
         with self.assertRaisesRegex(VerifyError, "not attached"):

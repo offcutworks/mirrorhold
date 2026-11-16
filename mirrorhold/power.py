@@ -3,8 +3,9 @@ named on Windows' shutdown screen.
 
 Both are the user's choices (``jobs.model.Activities.keep_awake`` and ``name_at_shutdown``, on
 by default) and hold only while the activity *works*: from the moment it is admitted
-(``records.admission``) to its end, but not while it waits for its turn, nor while the user has
-paused it (the maintainer's decision, 2026-10-15). The process re-reads the choices from the
+(``records.admission``) to its end, but not while it waits for a turn — a run's between two of
+its destinations included — nor while the user has paused it (the maintainer's decision,
+2026-10-15). The process re-reads the choices from the
 job file every ``CHOICES_INTERVAL`` seconds while it works, so a change saved in the window
 reaches an activity already working within that time.
 

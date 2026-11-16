@@ -150,7 +150,7 @@ def repair_row(r: RepairRecord, names: Mapping[int, str], live: Collection[str] 
 
 
 _LOG_STARTED_BY = {"manual": "by you", "unattended": "automatic", "arrival": "drive attached",
-                   "schedule": "on schedule"}
+                   "schedule": "on schedule", "logon": "at logon"}
 COULD_NOT_START = "Could not start"
 ENDED_WITHOUT_RECORD = "Ended without a record"
 

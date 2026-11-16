@@ -4,8 +4,11 @@ Callers never reach the engine: they write what they want of a run (``records.st
 and ``StatusPump`` — a thread of the run's own process — reads it twice a second into
 ``RunControl``. The run reconciles at safe points: between two steps of its own work
 (``checkpoint``), and while the engine copies, by suspending, resuming or stopping the
-engine through its adapter. The pump also takes the engine's live statistics into the
-published status, except while the engine is suspended.
+engine through its adapter. A paused activity uses no drive, and others may have begun on
+its drives meanwhile, so one asked to work again stays paused until it has them back
+(``pause_wanted``). The pump also takes the engine's live statistics into the published
+status, except while the engine is suspended; a place in line a caller moved it to reaches
+its status as it reads what they want.
 
 What the status counts as done while the engine works is what it processed: the files
 it copied and the files it compared and found identical, with their bytes. The rate is
@@ -20,6 +23,7 @@ import time
 from typing import Callable, Optional
 
 from ..engine.rclone import Transfer, TransferStats
+from ..records.admission import ADMISSION_INTERVAL, stay_paused, take_back
 from ..records.status import CancelMode, LiveStatus, StatusBoard, Wanted
 
 PUBLISH_INTERVAL = 0.5
@@ -45,10 +49,16 @@ def time_left(files_left: int, bytes_left: int, files_done: int, bytes_done: int
 
 
 class RunControl:
-    def __init__(self, status: LiveStatus):
+    """What callers want of an activity as it sees it. ``board``: its status board, through
+    which a paused one takes its drives back (``records.admission.take_back``); without one a
+    pause lifts at once."""
+
+    def __init__(self, status: LiveStatus, board: Optional[StatusBoard] = None):
         self._status = status
+        self._board = board
         self._wanted = Wanted()
         self._changed = threading.Condition()
+        self._next_attempt = 0.0
 
     @property
     def wanted(self) -> Wanted:
@@ -59,6 +69,8 @@ class RunControl:
         with self._changed:
             if wanted != self._wanted:
                 self._wanted = wanted
+                if wanted.queued is not None:
+                    self._status.queued = wanted.queued
                 self._changed.notify_all()
 
     @property
@@ -69,17 +81,38 @@ class RunControl:
         with self._changed:
             self._changed.wait(timeout)
 
-    def checkpoint(self) -> Optional[CancelMode]:
-        """Between two steps of the core's own work: wait while a pause is wanted, and
-        answer whether a cancel is."""
-        with self._changed:
-            while self._wanted.paused and self._wanted.cancel is None:
-                self._status.paused = True
-                self._changed.wait(PUBLISH_INTERVAL)
+    def pause_wanted(self) -> bool:
+        """Whether the activity is to be paused now: a pause is wanted, or it is paused,
+        asked to work again and its drives are not back yet. The caller pauses or works, and
+        publishes which; one that may work again is no longer paused by then. A cancel
+        outranks both."""
+        wanted = self.wanted
+        if wanted.cancel is None and not wanted.paused and self._status.paused:
+            return not self._take_back()
+        stay_paused(self._status)
+        return wanted.cancel is None and wanted.paused
+
+    def _take_back(self) -> bool:
+        if self._board is None:
             self._status.paused = False
-            if self._wanted.cancel is not None:
-                self._status.cancelling = self._wanted.cancel
-            return self._wanted.cancel
+            return True
+        now = time.monotonic()
+        if now < self._next_attempt:
+            return False
+        self._next_attempt = now + ADMISSION_INTERVAL
+        return take_back(self._board)
+
+    def checkpoint(self) -> Optional[CancelMode]:
+        """Between two steps of the core's own work: wait while the activity is to be
+        paused, and answer whether a cancel is wanted."""
+        while self.pause_wanted():
+            self._status.paused = True
+            self.wait_change(PUBLISH_INTERVAL)
+        self._status.paused = False
+        cancel = self.wanted.cancel
+        if cancel is not None:
+            self._status.cancelling = cancel
+        return cancel
 
 
 class StatusPump(threading.Thread):

@@ -18,6 +18,9 @@
   one scrolls the window as over any other control, and a choice changes only by click
   or keyboard.
 - ``ToneLabel`` styles: state is written in words, and colour only reinforces it.
+- ``switch_images``: the dot a list row shows for a switch — filled on, a ring off, a ring
+  with a centre for some — drawn smooth at the font's size, since a list row can hold an
+  image but no control.
 - ``LINK_STYLE``: a web address the user can click, underlined in the active tone.
 - ``DIVIDER_STYLE``: a paned window whose divider shows a grip of dots. The system
   theme draws a divider as a few pixels of nothing, which the user cannot find; the
@@ -38,14 +41,14 @@ import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import ttk
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from mirrorhold.icon import WINDOW_SIZES, png, render
 from mirrorhold.installation.shortcut import APP_ID
 from mirrorhold.locations import PROJECT_ROOT
 
 from .formatting import size as format_size
-from .jobs_model import Tone
+from .jobs_model import Switch, Tone
 from .shipped_model import icon_path
 from .window_model import Area
 
@@ -170,6 +173,44 @@ def tone_style(tone: Tone, *, headline: bool = False) -> str:
 def tag_tones(tree: ttk.Treeview) -> None:
     for tone, colour in TONE_COLOURS.items():
         tree.tag_configure(tone.value, foreground=colour)
+
+
+_SWITCH_ON = (0x0F, 0x6E, 0x56)     # the program's teal
+_SWITCH_OFF = (0x8A, 0x8A, 0x8A)    # 3.4:1 on the list's white, above the 3:1 a control needs
+_SAMPLES = 4                        # per side of a pixel: the dot's edge is drawn smooth
+
+
+def _switch_pixels(size: int, switch: Switch) -> List[Tuple[int, int, int, int]]:
+    """The dot of a switch, ``size`` pixels square, as RGBA rows: a filled dot when on, a
+    ring when off, a ring with a filled centre for a job with some destinations on. What
+    lies outside the dot is transparent, so a selected row's band shows through."""
+    centre, radius = size / 2, size * 0.30
+    ring = max(1.0, size / 14)
+    colour = _SWITCH_OFF if switch is Switch.OFF else _SWITCH_ON
+
+    def covered(x: float, y: float) -> bool:
+        d = ((x - centre) ** 2 + (y - centre) ** 2) ** 0.5
+        if switch is Switch.ON:
+            return d <= radius
+        return radius - ring <= d <= radius or (switch is Switch.SOME and d <= radius * 0.42)
+
+    pixels = []
+    for y in range(size):
+        for x in range(size):
+            hits = sum(covered(x + (i + 0.5) / _SAMPLES, y + (j + 0.5) / _SAMPLES)
+                       for j in range(_SAMPLES) for i in range(_SAMPLES))
+            pixels.append((*colour, round(255 * hits / _SAMPLES ** 2)))
+    return pixels
+
+
+def switch_images(widget: tk.Misc) -> Dict[Switch, tk.PhotoImage]:
+    """The dots a list draws before a row for a switch, by state, sized to the default
+    font so they scale with the display as the rows do. The caller keeps them: Tk drops an
+    image nothing in Python refers to."""
+    size = max(9, round(tkfont.nametofont("TkDefaultFont").metrics("linespace") * 0.62))
+    return {switch: tk.PhotoImage(master=widget,
+                                  data=base64.b64encode(png(size, _switch_pixels(size, switch))).decode("ascii"))
+            for switch in Switch}
 
 
 def size_to_content(window: tk.Toplevel, *, min_width: int = 0, min_height: int = 0,

@@ -164,6 +164,13 @@ class LookTest(unittest.TestCase):
         self.assertFalse(tray_look([waiting]).paused)
         self.assertEqual(tray_look([waiting]).fill, 0.0, "a waiting activity shows the copy empty")
 
+    def test_one_taking_its_drives_back_says_so_and_counts_as_paused(self):
+        waited = {"run_id": "w" * 32, "kind": "run", "job_name": "Work"}
+        back = alive(status("a", planned=10, done=5, paused=True, resuming=True, waiting_for=waited))
+        look = tray_look([back])
+        self.assertEqual(look.entries[0].line, "Backing up Photos -> 1: resuming, waiting for 'Work'")
+        self.assertTrue(look.paused)
+
     def test_nothing_alive_is_nothing_at_work(self):
         look = tray_look([ObservedRun(status(), False)])
         self.assertFalse(look.working)

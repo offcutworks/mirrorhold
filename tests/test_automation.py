@@ -5,12 +5,15 @@ definitions; reconciliation against a scheduler kept in memory, and the rule tha
 an installed copy serving the store gets tasks; which drives arrived and what an arrival
 runs; the scheduler's entry (``automatic``) with a runner, a boot time and settling of
 its own; what a run's notice says and how it is handed to Windows; the command line's
-``when``, ``reconcile`` and ``installation``. The last class runs an arrival through the
+``when`` (each destination's switch included), ``reconcile`` and ``installation``. A
+destination switched off is in no arrival's run, and a job with every one switched off has
+no task. The last class runs an arrival through the
 engine on temporary folders mapped as volumes.
 
 The real scheduler, a real arrival and a real notification were checked live on the
 development machine; nothing here reaches them."""
 import ctypes
+import json
 import os
 import subprocess
 import time
@@ -22,17 +25,17 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from support import TempDirTest, endpoint, volume
+from support import TempDirTest, endpoint, every_destination, live_activity, volume
 from test_engine_contract import INSTALLED
 
 from mirrorhold import cli
 from mirrorhold.automation.arrival import (PresenceState, arrival_selection, arrivals, destination_key,
                                            present_keys, read_state, settled_volumes, source_key, state_path,
                                            write_state)
-from mirrorhold.automation.automatic import run_on_arrival, run_scheduled
+from mirrorhold.automation.automatic import run_at_logon, run_on_arrival, run_scheduled
 from mirrorhold.automation.reconcile import AutomationState, apply_automation, reconcile, remove_all
 from mirrorhold.automation.scheduler import RegisteredTask, SchedulerError, WindowsScheduler
-from mirrorhold.automation.tasks import (ARRIVAL, SCHEDULE, Launcher, desired_tasks, fingerprint_of, task_name,
+from mirrorhold.automation.tasks import (ARRIVAL, LOGON, SCHEDULE, Launcher, desired_tasks, fingerprint_of, task_name,
                                          task_xml)
 from mirrorhold.contract_errors import ContractError
 from mirrorhold.endpoints.volumes import FixedVolumeSource, VolumeScan
@@ -47,8 +50,9 @@ from mirrorhold.notifications import windows_runtime
 from mirrorhold.notifications.toast import (POWERSHELL_APP_ID, SWITCH_VARIABLE, NotificationError, SilentNotifier,
                                             ToastNotifier, default_notifier, toast_xml)
 from mirrorhold.installation.shortcut import APP_ID
-from mirrorhold.records.record import (DONE_KEYS, LEFT_KEYS, PLANNED_KEYS, Outcome, RunRecord, read_records,
-                                       write_record)
+from mirrorhold.records.record import (DONE_KEYS, LEFT_BY_USER, LEFT_KEYS, NEVER_BEGUN, PLANNED_KEYS, PROCESS_ENDED,
+                                       Outcome, RunRecord, read_records, write_record)
+from mirrorhold.records.status import LiveStatus
 from mirrorhold.run.runner import JobRunResult, RunError, RunOptions, preview_job, run_job
 
 NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
@@ -154,7 +158,7 @@ class ScheduleGrammarTest(unittest.TestCase):
 
     def test_a_new_job_runs_only_when_started(self):
         job = a_job()
-        self.assertEqual((job.triggers, job.enabled), (Triggers(False, None), True))
+        self.assertEqual((job.triggers, job.switched_on), (Triggers(False, None), (1, 2)))
         self.assertEqual(desired_tasks([job], launcher()), {})
 
 
@@ -321,10 +325,18 @@ class TaskDefinitionTest(unittest.TestCase):
         manual = a_job("Manual")
         arrival = a_job("Arrival", triggers=Triggers(True))
         both = a_job("Both", triggers=Triggers(True, "daily 21:00"))
-        paused = a_job("Paused", triggers=Triggers(True, "daily 21:00"), enabled=False)
+        paused = every_destination(a_job("Paused", triggers=Triggers(True, "daily 21:00")), False)
         wanted = desired_tasks([manual, arrival, both, paused], launcher())
         self.assertEqual(set(wanted), {task_name(arrival.job_id, ARRIVAL), task_name(both.job_id, ARRIVAL),
                                        task_name(both.job_id, SCHEDULE)})
+
+    def test_a_job_with_every_destination_switched_off_calls_for_no_task(self):
+        job = a_job("Both", triggers=Triggers(True, "daily 21:00"))
+        one_off = replace(job, destinations=(job.destinations[0], replace(job.destinations[1], switched_on=False)))
+        all_off = replace(job, destinations=tuple(replace(d, switched_on=False) for d in job.destinations))
+        self.assertEqual(set(desired_tasks([one_off], launcher())),
+                         {task_name(job.job_id, ARRIVAL), task_name(job.job_id, SCHEDULE)})
+        self.assertEqual(desired_tasks([all_off], launcher()), {})
 
     def test_an_arrival_task(self):
         job = a_job('Work & "home"', triggers=Triggers(True))
@@ -374,6 +386,21 @@ class TaskDefinitionTest(unittest.TestCase):
         self.assertIn("automatic", task.find("t:Actions/t:Exec/t:Arguments", NS).text.split())
         self.assertTrue(task.find("t:Actions/t:Exec/t:Arguments", NS).text.endswith("--by schedule"))
 
+    def test_a_schedule_with_no_arrival_also_has_a_logon_task_and_the_schedules_stays_as_it_was(self):
+        alone = a_job("Alone", triggers=Triggers(False, "daily 21:00"))
+        both = a_job("Both", triggers=Triggers(True, "daily 21:00"))
+        wanted = desired_tasks([alone, both], launcher())
+        self.assertEqual(set(wanted), {task_name(alone.job_id, SCHEDULE), task_name(alone.job_id, LOGON),
+                                       task_name(both.job_id, SCHEDULE), task_name(both.job_id, ARRIVAL)})
+        task = parse(task_xml(wanted[task_name(alone.job_id, LOGON)], datetime(2026, 10, 6, 21, 30)))
+        self.assertEqual([child.tag.split("}")[1] for child in task.find("t:Triggers", NS)], ["LogonTrigger"])
+        self.assertEqual(task.find("t:Triggers/t:LogonTrigger/t:UserId", NS).text, "PC\\someone")
+        self.assertEqual(task.find("t:Triggers/t:LogonTrigger/t:Delay", NS).text, "PT1M")
+        self.assertTrue(task.find("t:Actions/t:Exec/t:Arguments", NS).text.endswith("--by logon"))
+        self.assertIn("at logon", task.find("t:RegistrationInfo/t:Description", NS).text)
+        schedule = parse(task_xml(wanted[task_name(alone.job_id, SCHEDULE)], datetime(2026, 10, 6, 21, 30)))
+        self.assertIsNone(schedule.find("t:Triggers/t:LogonTrigger", NS), "its catch-up stands on its definition")
+
     def test_the_fingerprint_follows_what_the_definition_depends_on(self):
         job = a_job(triggers=Triggers(True, "daily 21:00"))
         name = task_name(job.job_id, SCHEDULE)
@@ -410,7 +437,7 @@ class ReconcileTest(TempDirTest):
         changed = desired_tasks([replace(self.job, triggers=Triggers(True, "daily 06:00"))], launcher())
         third = reconcile(scheduler, changed, datetime(2026, 10, 7, 12, 0))
         self.assertEqual(third.registered, (task_name(self.job.job_id, SCHEDULE),))
-        paused = reconcile(scheduler, desired_tasks([replace(self.job, enabled=False)], launcher()))
+        paused = reconcile(scheduler, desired_tasks([every_destination(self.job, False)], launcher()))
         self.assertEqual(set(paused.removed), set(wanted))
         self.assertEqual(scheduler.xml, {})
 
@@ -489,6 +516,14 @@ class ArrivalLogicTest(TempDirTest):
         self.assertEqual(arrival_selection(self.job, everything, frozenset({self.dest[1]})), (2,))
         self.assertIsNone(arrival_selection(self.job, frozenset(self.dest), frozenset(self.dest)))
         self.assertIsNone(arrival_selection(self.job, everything, frozenset()))
+
+    def test_an_arrival_never_runs_a_destination_switched_off(self):
+        first_off = replace(self.job, destinations=(replace(self.job.destinations[0], switched_on=False),
+                                                    self.job.destinations[1]))
+        everything = frozenset({self.src, *self.dest})
+        self.assertEqual(arrival_selection(first_off, everything, frozenset({self.src})), (2,))
+        self.assertIsNone(arrival_selection(first_off, everything, frozenset({self.dest[0]})))
+        self.assertEqual(arrival_selection(first_off, everything, frozenset(self.dest)), (2,))
 
     def test_arrivals_within_and_across_sessions(self):
         present = frozenset({self.src, self.dest[0]})
@@ -616,7 +651,7 @@ class AutomaticEntryTest(TempDirTest):
         self.volumes = [self.d]
         self.assertEqual(self.arrive(FakeRunner()).runs, [])
         self.volumes = [self.s, self.d]
-        for changed, why in ((replace(self.job, enabled=False), "paused"),
+        for changed, why in ((every_destination(self.job, False), "every destination of the job is switched off"),
                              (replace(self.job, triggers=Triggers(False, "daily 21:00")), "attached")):
             self.store.save(StoreContents((changed,)))
             result = self.arrive(FakeRunner())
@@ -665,6 +700,72 @@ class AutomaticEntryTest(TempDirTest):
                                notifier=Refusing(), runner=FakeRunner(error=RunError("the engine is missing")))
         self.assertEqual((ran.problems, failed.problems), ([REFUSAL], [REFUSAL]))
         self.assertEqual(failed.failure, "the engine is missing")
+
+    def logon(self, runner, notifier=None):
+        return run_at_logon(self.store, self.job.job_id, volume_source=FixedVolumeSource(()), sync_roots=(),
+                            notifier=notifier, runner=runner)
+
+    def on_a_schedule_alone(self):
+        self.job = replace(self.job, triggers=Triggers(False, "daily 21:00"))
+        self.store.save(StoreContents((self.job,)))
+        return runtime_layout(self.store.path)
+
+    def recorded(self, layout, index, outcome, started, reasons=()):
+        write_record(layout, replace(a_record(self.job, index, outcome, reasons=reasons), started=started,
+                                     ended=started, run_id=started[-3:-1] * 16))
+
+    def test_a_logon_after_an_ordinary_start_runs_nothing(self):
+        layout, runner = self.on_a_schedule_alone(), FakeRunner()
+        self.recorded(layout, 1, Outcome.COMPLETED, "2026-11-07T23:00:00Z")
+        result = self.logon(runner)
+        self.assertEqual((result.runs, result.nothing_because), ([], "no run of the job was cut short"))
+
+    def test_a_logon_continues_a_run_a_shutdown_cut_short_as_the_schedule_would(self):
+        layout, runner, shown = self.on_a_schedule_alone(), FakeRunner(), Shown()
+        self.recorded(layout, 1, Outcome.COMPLETED, "2026-11-07T23:00:00Z")
+        self.recorded(layout, 2, Outcome.INTERRUPTED, "2026-11-07T23:30:00Z", (PROCESS_ENDED,))
+        result = self.logon(runner, shown)
+        self.assertEqual([(o.destinations, o.automatic, o.unattended) for o in runner.options],
+                         [(None, "schedule", True)])
+        self.assertEqual(len(result.records), 2)
+        self.assertEqual(len(shown.notices), 1)
+
+    def test_a_logon_continues_a_run_that_died_waiting_for_its_turn(self):
+        layout, runner = self.on_a_schedule_alone(), FakeRunner()
+        layout.status_dir.mkdir(parents=True)
+        status = LiveStatus("d" * 32, 1, self.job.job_id, self.job.name, "schedule", "2026-11-07T23:00:00Z",
+                            selected=[1, 2], markers=[d.marker_id for d in self.job.destinations])
+        (layout.status_dir / f"{'d' * 32}.json").write_text(json.dumps(status.to_document()), encoding="utf-8")
+        self.assertEqual(len(self.logon(runner).records), 2)
+        self.assertEqual([r.reasons for r in read_records(layout, self.job.job_id)[:2]], [(NEVER_BEGUN,)] * 2)
+
+    def test_what_came_after_a_cut_run_leaves_a_logon_nothing_to_do(self):
+        layout, runner = self.on_a_schedule_alone(), FakeRunner()
+        self.recorded(layout, 1, Outcome.INTERRUPTED, "2026-11-07T23:00:00Z", (PROCESS_ENDED,))
+        self.recorded(layout, 1, Outcome.COMPLETED, "2026-11-07T23:30:00Z")
+        self.assertEqual(self.logon(runner).runs, [])
+
+    def test_a_logon_leaves_what_the_user_had_paused_or_was_stopping(self):
+        layout, runner = self.on_a_schedule_alone(), FakeRunner()
+        self.recorded(layout, 1, Outcome.INTERRUPTED, "2026-11-07T23:00:00Z", (PROCESS_ENDED, LEFT_BY_USER))
+        self.assertEqual(self.logon(runner).runs, [])
+
+    def test_a_logon_starts_no_second_run_beside_one_in_progress(self):
+        layout, runner = self.on_a_schedule_alone(), FakeRunner()
+        self.recorded(layout, 1, Outcome.INTERRUPTED, "2026-11-07T23:00:00Z", (PROCESS_ENDED,))
+        board = live_activity(layout, self.job.job_id, job_name=self.job.name)
+        self.addCleanup(board.close)
+        self.assertEqual(self.logon(runner).runs, [])
+
+    def test_a_logon_runs_nothing_for_a_job_that_no_longer_runs_by_itself(self):
+        layout = self.on_a_schedule_alone()
+        self.recorded(layout, 1, Outcome.INTERRUPTED, "2026-11-07T23:00:00Z", (PROCESS_ENDED,))
+        for changed, why in ((every_destination(self.job, False), "every destination of the job is switched off"),
+                             (replace(self.job, triggers=Triggers(True)), "schedule")):
+            self.store.save(StoreContents((changed,)))
+            result = self.logon(FakeRunner())
+            self.assertEqual(result.runs, [])
+            self.assertIn(why, result.nothing_because)
 
     def test_an_automatic_run_is_unattended(self):
         with self.assertRaises(RunError):
@@ -878,6 +979,49 @@ class CommandLineAutomationTest(TempDirTest):
         self.assertIn("automatic runs paused", out)
         self.assertEqual(self.scheduler.calls, [])                                # never installed: never touched
 
+    def test_a_job_with_no_automatic_runs_says_it_is_switched_off(self):
+        self.assertEqual(self.cli("add", "Work", "--source", str(self.vol_s / "Work"), "--dest",
+                                  str(self.vol_d / "Work"), "--no-survey")[0], 0)
+        code, out = self.cli("when", "Work", "--automatic", "off")
+        self.assertEqual(code, 0, out)
+        self.assertIn("job 'Work' runs when you start it naming its destinations (every destination switched off)\n",
+                      out)
+        self.assertEqual([d.switched_on for d in ConfigStore(self.store_path).load().contents.jobs[0].destinations],
+                         [False])
+        code, out = self.cli("jobs")
+        self.assertIn("runs         when you start it naming its destinations (every destination switched off)\n", out)
+        code, out = self.cli("when", "Work", "--automatic", "on")
+        self.assertIn("job 'Work' runs when you start it\n", out)
+
+    def test_when_switches_the_destinations_named_or_every_one(self):
+        (self.vol_d / "Two").mkdir()
+        self.assertEqual(self.cli("add", "Work", "--source", str(self.vol_s / "Work"), "--dest",
+                                  str(self.vol_d / "Work"), "--dest", str(self.vol_d / "Two"), "--no-survey")[0], 0)
+
+        def switches():
+            return [d.switched_on for d in ConfigStore(self.store_path).load().contents.jobs[0].destinations]
+
+        code, out = self.cli("when", "Work", "--automatic", "off", "--dest", "2")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(switches(), [True, False])
+        self.assertIn("job 'Work' runs when you start it (destination 2 switched off)\n", out)
+        code, out = self.cli("jobs")
+        listed = {line.split()[1]: line for line in out.splitlines() if line.startswith("    destination ")}
+        self.assertEqual((listed["1"].endswith("[switched off]"), listed["2"].endswith(" [switched off]")),
+                         (False, True))
+        code, out = self.cli("when", "Work", "--automatic", "off")
+        self.assertEqual(switches(), [False, False])
+        self.assertIn("every destination switched off", out)
+        code, out = self.cli("when", "Work", "--automatic", "on", "--dest", "1")
+        self.assertEqual(switches(), [True, False])
+        code, out = self.cli("when", "Work", "--automatic", "on", "--dest", "3")
+        self.assertEqual(code, 1)
+        self.assertIn("no destination 3", out)
+        code, out = self.cli("when", "Work", "--dest", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("--dest and --marker name the destinations --automatic switches", out)
+        self.assertEqual(switches(), [True, False])
+
     def test_job_changes_reconcile_the_tasks_of_an_installed_copy(self):
         self.root.mkdir()
         write_installation(InstalledCopy(self.root, "1.0.0", "2026-10-06T12:00:00+00:00", self.store_path,
@@ -894,6 +1038,14 @@ class CommandLineAutomationTest(TempDirTest):
         self.assertIn("installed at", self.cli("installation")[1])
         self.cli("remove", "Work")
         self.assertEqual(self.scheduler.xml, {})
+
+    def test_the_command_a_logon_task_runs(self):
+        self.cli("add", "Work", "--source", str(self.vol_s / "Work"), "--dest", str(self.vol_d / "Work"),
+                 "--no-survey")
+        self.cli("when", "Work", "--schedule", "daily 21:00")
+        job = ConfigStore(self.store_path).load().contents.jobs[0]
+        code, out = self.cli("automatic", job.job_id, "--by", "logon")
+        self.assertEqual((code, out), (0, "nothing ran: no run of the job was cut short\n"))
 
 
 @needs_engine

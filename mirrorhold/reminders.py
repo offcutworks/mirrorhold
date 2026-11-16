@@ -16,8 +16,8 @@ decide it, and a process that raises no notice leaves none. Like the icon, it is
 reminder that cannot be written or read costs the reminder, never the activity, and a file that
 cannot be read is still shown, in general words, until it is cleared.
 
-Nothing starts at sign-in, so a reminder outlives a restart only as a file: the icon shows it
-again with the store's next activity, and the window clears it as ever.
+The icon does not start at sign-in, so a reminder outlives a restart only as a file: the icon
+shows it again with the store's next activity, and the window clears it as ever.
 """
 from __future__ import annotations
 

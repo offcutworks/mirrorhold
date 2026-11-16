@@ -188,6 +188,10 @@ Design patterns
   destination selected is acted on alone: *Run now* runs a job whole only when its own
   row or its group's is selected, and the selected destinations alone otherwise
   (``Selection.chosen``), as a preview opened from a destination previews and runs it alone.
+  Each destination's switch (``Destination.switched_on``) is set in the list itself: a job
+  run whole runs its destinations switched on (``JobRow.serving``), one with none is left
+  out (``Selection.switched_off``), and a destination selected itself runs whatever its
+  switch; verification is not affected by the switches.
 
 Caveats
 -------
@@ -287,15 +291,15 @@ Caveats
 - Groups only arrange the list: a group's run is its jobs' runs, admitted like any
   others, so jobs on one drive take turns there or share its speed, as the user's choice
   and the drive's kind — as Windows reports it or as the user marked it — say
-  (Preferences). Jobs move between groups from the
-  right-click menu alone; a group moves among the groups, and a job within its group or
-  among the jobs in no group, one place at a time from the same menu or with Alt+Up and
-  Alt+Down. The order is the job file's, read alike by every surface; each move is saved
-  at once, with no previous copy kept and the scheduled tasks left alone. Which groups
-  are closed, and the main window's place — size, position, maximised, divider — are the
-  window's remembered state, saved as the window closes when it can be (never over a
-  file changed elsewhere), and a save of that state alone keeps no previous copy of the
-  job file. A remembered place is fitted to the monitors attached when the window opens;
+  (Preferences). Jobs move between groups from the list's right-click menu alone, which
+  Shift+F10 and the Menu key open too; a group moves among the groups, and a job within
+  its group or among the jobs in no group, one place at a time from the same menu or with
+  Alt+Up and Alt+Down. The order is the job file's, read alike by every surface; each
+  move is saved at once, with no previous copy kept and the scheduled tasks left alone.
+  Which groups are closed, and the main window's place — size, position, maximised,
+  divider — are the window's remembered state, saved as the window closes when it can be
+  (never over a file changed elsewhere), and a save of that state alone keeps no previous
+  copy of the job file. A remembered place is fitted to the monitors attached when the window opens;
   one it cannot use is passed over silently.
 - A window keeps on its face the words a choice needs; what explains a choice is the
   hint of its control (``common_view.Hint``), shown while the pointer rests on it. A

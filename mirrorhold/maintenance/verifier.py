@@ -86,7 +86,8 @@ one that writes what it reads, or one that uses a drive it uses and takes turns 
 drive — held back by verifications alone (``records.admission.gives_way``), the verification —
 paused or not — saves its progress, gives its claim up and waits for its turn again,
 behind that run; then it lists both sides again and continues from its cursor. A run it
-does not conflict with works beside it.
+does not conflict with works beside it, and so does one that shares only a drive with it
+while it is paused.
 """
 from __future__ import annotations
 
@@ -357,7 +358,7 @@ class _Verifier:
                                  destination=f"destination {index}", pair_started=utc_now(), kind=KIND_VERIFICATION,
                                  verify=self._progress_document())
         self.board = StatusBoard(self.layout, self.status)
-        self.control = RunControl(self.status)
+        self.control = RunControl(self.status, self.board)
         self.hold = Hold(verification_reason(job.name), lambda: self.status.admitted and not self.status.paused,
                          lambda: _load(store).preferences.activities, system=power)
         self.pump = StatusPump(self.board, self.control, on_tick=self.hold.tick)
@@ -443,7 +444,7 @@ class _Verifier:
                 raise _Stop()
             if self._should_give_way():
                 raise _GiveWay()
-            if not wanted.paused:
+            if not self.control.pause_wanted():
                 self.status.paused = False
                 return
             self.status.paused = True
@@ -811,7 +812,7 @@ class _Verifier:
                         if reason is _Stop:
                             raise _Stop(item.path, self.stop_patience)
                         break
-                if wanted.paused and reason is None:
+                if reason is None and self.control.pause_wanted():
                     hold.set()
                     self.status.paused = True
                 else:
@@ -896,7 +897,7 @@ class _Verifier:
                 if reason is not None:
                     check.stop()
                     break
-                if wanted.paused:
+                if self.control.pause_wanted():
                     check.suspend()
                     self.status.paused = True
                 else:

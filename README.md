@@ -103,11 +103,19 @@ you unpack it and installs nothing.
 2. Check the download. In PowerShell, in the folder you saved both to, run
    `Get-FileHash .\MirrorHold-<release>-setup.exe`: the hash it prints must be the one
    `SHA256SUMS` gives for that file. If it is not, delete the file.
-3. Double-click the setup program and choose *Install*. It installs MirrorHold for you
-   alone, needing no administrator rights, into `%LOCALAPPDATA%\Programs\MirrorHold`, and
-   sets it up: a *MirrorHold* entry in the Start menu, and the scheduled tasks your jobs'
-   automatic runs need ([Automatic runs](#automatic-runs)). MirrorHold is then listed
-   among Windows' installed apps, and the setup program's last page offers to open it.
+3. Double-click the setup program, choose the folder to install MirrorHold into —
+   `%LOCALAPPDATA%\Programs\MirrorHold` unless you choose another — then *Install*. It
+   installs MirrorHold for you alone, needing no administrator rights, and sets it up: a
+   *MirrorHold* entry in the Start menu, and the scheduled tasks your jobs' automatic runs
+   need ([Automatic runs](#automatic-runs)). MirrorHold is then listed among Windows'
+   installed apps, and the setup program's last page offers to open it.
+
+The folder must be new or empty, somewhere you can write, outside
+`%LOCALAPPDATA%\MirrorHold`, which keeps your jobs, and on a drive Windows counts as fixed —
+not a removable, network or optical one: removing MirrorHold deletes its folder with
+everything in it, and its automatic runs start it from there. Windows counts many USB disks
+as fixed, so choose one only if it stays attached. A later setup program updates MirrorHold
+in the folder it is in; to move it, remove it and install it again.
 
 Where MirrorHold cannot be set up — it is installed from source on this account, say — the
 setup program says why in MirrorHold's own words and leaves nothing installed.
@@ -255,10 +263,22 @@ automatic runs need, in the folder `\MirrorHold`, all starting the copy that is 
 from its folder. Nothing stays running in the background but the icon of a reminder you have
 not yet seen (below).
 
+Each destination has a switch: the dot at the start of its row in the job list, filled
+when on and a ring when off; click it, press Space, or right-click and choose *Switched on*. A job's own
+dot switches all its destinations at once. A destination switched off is never backed up
+by an automatic run, and is left out when you choose *Run now* on its job or its group;
+select the destination itself and it still runs.
+
 A schedule runs a job every day, on the weekdays you choose, or on one day of every month
 (the 1st to the 28th, or the last day). On those days it runs at the times you list, up to
 48, or every 1 to 12 hours, all day or between two times, which may run past midnight. A
 run that falls while the computer is off runs at the next opportunity.
+
+A run a shutdown or a crash cuts short, working or waiting for its turn, is not such a run,
+since it did start. For a job on a schedule alone, MirrorHold looks about a minute after you
+next sign in: it continues the run, or does nothing if no run was cut short. A job that runs
+when its drives are attached runs at sign-in anyway, with them attached. A run you had
+paused or were cancelling is not continued: the schedule's next time runs it.
 
 When a run ends it shows a Windows notification. You choose which ones in
 *Preferences*. When a backup the run made is due a full verification (*Remind me to
@@ -289,6 +309,26 @@ to have them take turns on every drive, or *Always at the same time* to let them
 every drive. Runs on different drives run side by side unless they use the same folders.
 Activities that reach a remote always take turns with each other.
 
+A run uses a backup drive only while it backs up the destination there: done with it, it
+gives the drive up, so another job's run can use that drive while this one goes on with its
+other destinations. When the drive of its next destination is in use, it backs up first a
+destination whose drive is free and comes back to that one once it is freed, so a job's
+destinations do not always finish in their order. Between two destinations it waits like
+any other run, saying whom it waits for, and goes before every run, verification or repair
+still waiting to start, even one moved to the front with *Run next*.
+
+Pausing one gives up its drives: whatever waits only for them starts. It keeps its folders
+and, while it works on a remote, its turn there, so another run of its job, or one that uses
+its folders, goes on waiting. When you resume it, it takes its drives back as soon as nothing at work uses them.
+Until then it reads *resuming, waiting for 'Work'*, and you can pause it again; to have it
+go first, pause the one it waits for.
+
+*Run next*, on a waiting run or repair in the *Runs* tab or on the icon's menu, moves it to
+the front of the line, and is greyed for the one next in line. A verification has none: it
+goes behind every run and repair wherever it stands. Cancelling a run that has another run
+of its job waiting behind it, which would otherwise start at once, cancels that one too
+unless you untick *Also cancel the run of this job waiting behind it*.
+
 Beneath the choice, *Preferences* lists each drive attached, with what Windows reports it
 as, and each drive you have set that is not attached. Set a drive to *Hard disk*, *Solid-state
 drive* or *Cloud drive* to say what it is — a USB solid-state drive Windows says nothing of,
@@ -306,18 +346,20 @@ the timer decide, untick *Keep the computer from going to sleep* in *Preferences
 While the work goes on, MirrorHold also asks Windows' shutdown screen to name it and offer to
 cancel the shutdown, so a shutdown waits for you to choose *Shut down anyway* or *Cancel*. If
 the work ends first, MirrorHold stops holding the shutdown up, and work a shutdown cuts
-continues at its next run. To shut down without being asked, untick *Show it on Windows'
+continues at its next run; a job with automatic runs takes up a backup it cut as you next
+sign in (*Automatic runs*). To shut down without being asked, untick *Show it on Windows'
 shutdown screen* in *Preferences*.
 
 Whoever started the work — you, a schedule or a drive's arrival — MirrorHold's icon sits in
 the notification area while it goes on, its outlined block, the copy, filling as the work
 progresses and its tile turning grey while the work is paused. Point at it to see what works
 and how far. Click it to open MirrorHold, or to bring forward the window already open;
-right-click it to pause, resume, cancel or stop each run, verification or repair, with the
-questions the *Runs* tab asks. The icon goes a few seconds after the last one ends, unless
+right-click it to pause, resume, cancel or stop each run, verification or repair, or to move
+a waiting one to the front of the line, with the questions the *Runs* tab asks. The icon goes
+a few seconds after the last one ends, unless
 the work left a reminder: the icon then stays, its tile amber, and pointing at it or
 right-clicking it shows what to look at, until you open MirrorHold, bring its window to the
-front, or dismiss it in the icon's menu. Nothing starts with Windows, so a reminder
+front, or dismiss it in the icon's menu. The icon does not start with Windows, so a reminder
 left before a restart shows again with the next run, verification or repair. Windows may at
 first keep the icon among the hidden icons, behind the arrow at the edge of the notification
 area, until you choose to show it.
@@ -355,8 +397,9 @@ delete that folder too, and your backups stay on their drives.
   (`logs\`) — never the
   release's own folder, so deleting a release loses none of it. Run
   from source (below), the same files are in `Config\` beside the program.
-- The setup program installs MirrorHold itself in `%LOCALAPPDATA%\Programs\MirrorHold`,
-  which an update replaces and removing it deletes: nothing of yours is kept there.
+- The setup program installs MirrorHold itself in the folder you chose,
+  `%LOCALAPPDATA%\Programs\MirrorHold` unless you chose another, which an update replaces
+  and removing it deletes: nothing of yours is kept there.
 - *File*, *Save history...* saves what the History tab shows — one job's runs, a
   group's, or every job's when nothing is selected — as a CSV file a spreadsheet opens;
   *Save log...* saves every log as one text file. Both go only where you choose.
@@ -371,8 +414,9 @@ delete that folder too, and your backups stay on their drives.
 
 ## Command line
 
-Everything the window does is also a command, run in the release's folder —
-`%LOCALAPPDATA%\Programs\MirrorHold` where the setup program installed it:
+Everything the window does is also a command, run in the release's folder — the folder
+the setup program installed it into, `%LOCALAPPDATA%\Programs\MirrorHold` unless you chose
+another:
 
 ```
 runtime\python -m mirrorhold --help

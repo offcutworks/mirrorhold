@@ -19,11 +19,21 @@ selected rows reach, or every job's when nothing is selected (``history_model``)
 File menu saves what History shows, and every diagnostic log, to files the user chooses.
 
 The list holds groups above their jobs and takes several rows at once (Ctrl and Shift);
-what the selection allows is ``groups_model.Selection``'s. Jobs are moved between
-groups from the right-click menu, and a group, or a job within its level, up or down
-from it or with Alt+Up and Alt+Down. A row whose drive is not attached stays listed, grey
-(``jobs_model``'s absent tone). The list and the Runs and History tabs share the window
-across a divider with a visible grip (``common_view.DIVIDER_STYLE``) the user drags.
+what the selection allows is ``groups_model.Selection``'s. Its right-click menu opens from
+the keyboard too, with Shift+F10 or the Menu key. Jobs are moved between groups from that
+menu, and a group, or a job within its level, up or down from it or with Alt+Up and
+Alt+Down. A row whose drive is not attached stays listed, grey
+(``jobs_model``'s absent tone). Each destination row begins with its switch, drawn as a
+small dot (``common_view.switch_images``): filled when on, a grey ring when off, the
+pointer a hand over it; a job row's dot stands for its destinations together, a ring
+with a centre while some are off. A click on a destination's dot switches it, a click on
+a job's switches every destination of it — on unless every one is on — and *Switched on*
+in the right-click menu, or Space, switches every destination the selection reaches;
+each saves at once, as an edit would, without changing the selection, and which
+destinations of which jobs change is ``groups_model.switched``'s. A destination
+switched off runs only when it is selected itself (``groups_model``) and never by
+itself. The list and the Runs and History tabs share the window across a divider with a
+visible grip (``common_view.DIVIDER_STYLE``) the user drags.
 
 As the window closes, which groups the user closed and the window's place — its size,
 position, whether it is maximised, and the divider — are kept in the job file's
@@ -74,16 +84,17 @@ from mirrorhold.wording import counted
 
 from .about_model import about_content, licence_path, notices_path
 from .about_view import AboutWindow
-from .common_view import (DIVIDER_STYLE, PAD, choose, em, frame_size, set_enabled, size_to_content, tag_tones,
-                          work_areas)
+from .common_view import (DIVIDER_STYLE, PAD, choose, em, frame_size, set_enabled, size_to_content,
+                          switch_images, tag_tones, work_areas)
 from .editor_view import EditorWindow
 from .groups_model import (NEW_GROUP_NOTE, Selection, collapsed_groups, delete_group_question, remove_jobs_question,
-                           reordered, run_several, verify_several, with_collapsed)
+                           keyboard_menu, reordered, run_several, switched, switching_on, verify_several,
+                           with_collapsed)
 from .groups_view import ask_group_name
 from .history_model import JobHistory, empty_words, history_file_name, log_file_name, save_history
 from .history_view import HistoryPanel
-from .jobs_model import (DestinationRow, GroupRow, JobRow, arrange, build_rows, first_backup_question, job_has_run,
-                         log_job, place_under, row_by_iid)
+from .jobs_model import (DestinationRow, GroupRow, JobRow, Switch, arrange, build_rows, first_backup_question,
+                         job_has_run, log_job, place_under, row_by_iid)
 from .prefs_model import automation_problem
 from .prefs_view import PreferencesWindow
 from .preview_view import PreviewWindow
@@ -159,7 +170,7 @@ class MainWindow:
         runs_tab = ttk.Frame(self.notebook, padding=PAD)
         runs_tab.columnconfigure(0, weight=1)
         runs_tab.rowconfigure(0, weight=1)
-        self.runs_panel = RunsPanel(runs_tab, session, self._status_of)
+        self.runs_panel = RunsPanel(runs_tab, session, self._status_of, self._live_statuses)
         self.runs_panel.grid(row=0, column=0, sticky="nsew")
         history_tab = ttk.Frame(self.notebook, padding=PAD)
         history_tab.columnconfigure(0, weight=1)
@@ -235,13 +246,20 @@ class MainWindow:
         self.tree.column("verified", width=font.measure("2026-10-06 - due") + pad, stretch=False)
         self.tree.column("status", width=font.measure("Completed - 12 files not backed up") + pad, stretch=True)
         tag_tones(self.tree)
+        self._switch_images = switch_images(self.tree)     # by Switch; kept, since Tk drops an image unreferenced
         bar = ttk.Scrollbar(top, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=bar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         bar.grid(row=0, column=1, sticky="ns")
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._selection_changed())
-        self.tree.bind("<Double-1>", lambda e: self._double_click())
+        self.tree.bind("<Button-1>", self._clicked)
+        self.tree.bind("<Double-1>", lambda e: self._clicked(e) or self._double_click())
+        self.tree.bind("<space>", self._space)
+        self.tree.bind("<Motion>", self._pointed)
+        self.tree.bind("<Leave>", lambda e: self.tree.configure(cursor=""))
         self.tree.bind("<Button-3>", self._context_menu)
+        self.tree.bind("<Shift-F10>", self._context_key)   # the keyboard's ways to the same menu
+        self.tree.bind("<App>", self._context_key)
         self.tree.bind("<<TreeviewOpen>>", lambda e: self._toggled(opened=True))
         self.tree.bind("<<TreeviewClose>>", lambda e: self._toggled(opened=False))
         self.tree.bind("<Alt-Up>", lambda e: self._move_key(-1))
@@ -276,6 +294,9 @@ class MainWindow:
 
     def _status_of(self, run_id: str) -> Optional[dict]:
         return next((r.status for r in self.runs if r.run_id == run_id), None)
+
+    def _live_statuses(self) -> List[dict]:
+        return [r.status for r in self.runs if r.alive and r.readable]
 
     # --- clocks --------------------------------------------------------------------------
 
@@ -389,12 +410,14 @@ class MainWindow:
 
     def _put_job(self, parent, position, row: JobRow, wanted: List[str]):
         wanted.append(row.iid)
-        self._put(parent, position, row.iid, f"{row.name}      {row.source}",
-                  (row.drive, row.last_success, "", "", row.status), row.tone.value, open_=True)
+        self._put(parent, position, row.iid, f" {row.name}      {row.source}",
+                  (row.drive, row.last_success, "", "", row.status), row.tone.value, open_=True,
+                  image=self._switch_images[row.switch])
         for d_position, d in enumerate(row.destinations):
             wanted.append(d.iid)
-            self._put(row.iid, d_position, d.iid, f"{d.index}  {d.folder}",
-                      (d.drive, d.last_success, d.free, d.verified, d.status), d.tone.value)
+            self._put(row.iid, d_position, d.iid, f" {d.index}  {d.folder}",
+                      (d.drive, d.last_success, d.free, d.verified, d.status), d.tone.value,
+                      image=self._switch_images[Switch.ON if d.switched_on else Switch.OFF])
 
     def _items(self, parent) -> set:
         """Every item under ``parent``, at any depth."""
@@ -404,13 +427,14 @@ class MainWindow:
             found |= self._items(iid)
         return found
 
-    def _put(self, parent, position, iid, text, values, tag, open_=False):
+    def _put(self, parent, position, iid, text, values, tag, open_=False, image=""):
         if self.tree.exists(iid):
-            self.tree.item(iid, text=text, values=values, tags=(tag,))
+            self.tree.item(iid, text=text, values=values, tags=(tag,), image=image)
             if self.tree.parent(iid) != parent or self.tree.index(iid) != position:
                 self.tree.move(iid, parent, position)
         else:
-            self.tree.insert(parent, position, iid=iid, text=text, values=values, tags=(tag,), open=open_)
+            self.tree.insert(parent, position, iid=iid, text=text, values=values, tags=(tag,), open=open_,
+                             image=image)
 
     def _status_line(self):
         live = [r for r in self.runs if r.alive and r.readable and not is_verification(r.status)
@@ -508,6 +532,41 @@ class MainWindow:
         for label in ("Import jobs...", "Preferences..."):
             _set_entry(self.file_menu, label, writable)
 
+    def _switch_at(self, event) -> Optional[object]:
+        """The job or destination row whose switch the pointer is on, or None."""
+        if self.tree.identify_region(event.x, event.y) != "tree":
+            return None
+        entry = self._by_iid.get(self.tree.identify_row(event.y))
+        if not isinstance(entry, (JobRow, DestinationRow)):
+            return None
+        return entry if self.tree.identify_element(event.x, event.y).endswith("image") else None
+
+    def _pointed(self, event) -> None:
+        """The pointer is a hand over a switch while the job file can be written; the cursor
+        is set only when that changes."""
+        cursor = "hand2" if self.session.writable and self._switch_at(event) is not None else ""
+        if str(self.tree.cget("cursor")) != cursor:
+            self.tree.configure(cursor=cursor)
+
+    def _space(self, _event) -> str:
+        """Space switches every destination the selection reaches — on unless every one is
+        on —, the keyboard's way to the switches; Return and the arrows open and close a row."""
+        rows = self.selection().destinations
+        if rows and self.session.writable:
+            self.switch(rows, switching_on(rows))
+        return "break"
+
+    def _clicked(self, event) -> Optional[str]:
+        """A click on a destination's switch switches it, on a job's every destination of it —
+        on unless every one is on — leaving the selection as it is; any other click, and
+        every click while the job file cannot be written, is the list's own."""
+        entry = self._switch_at(event)
+        if entry is None or not self.session.writable:
+            return None
+        rows = (entry,) if isinstance(entry, DestinationRow) else entry.destinations
+        self.switch(rows, switching_on(rows))
+        return "break"
+
     def _double_click(self):
         job, destination = self.selected()
         if destination is not None and destination.needs_review:
@@ -588,6 +647,14 @@ class MainWindow:
         if answer != "remove":
             return
         self._save(self.session.contents.without_job(job_row.job_id), "Not removed")
+
+    def switch(self, rows: Sequence[DestinationRow], on: bool):
+        """Switch the destinations ``rows`` on or off (``groups_model.switched``) and save,
+        which brings the scheduled tasks into line; a save refused or failed is reported,
+        and the list reloaded."""
+        contents = switched(self.session.contents, rows, on)
+        if contents is not None:
+            self._save(contents, "Not switched on" if on else "Not switched off")
 
     def remove_jobs(self, rows: Sequence[JobRow]):
         title, text = remove_jobs_question(rows)
@@ -672,9 +739,39 @@ class MainWindow:
             self.tree.selection_set(iid)
             self.tree.focus(iid)
             self._selection_changed()
+        self._popup(event.x_root, event.y_root)
+
+    def _context_key(self, _event) -> str:
+        """Shift+F10 or the Menu key: the selection's menu, where ``groups_model.keyboard_menu``
+        says. A selection made here reaches the window through the list's own
+        <<TreeviewSelect>>. "break": Tk's own F10 binding, which Shift+F10 would reach too,
+        opens the window's menu bar."""
+        place = keyboard_menu(self.tree.focus(), self.tree.selection(), self._ancestors)
+        if place is None:
+            return "break"
+        select, under = place
+        if select is not None:
+            self.tree.selection_set(select)
+        self.tree.see(under)             # scrolls only: every parent of ``under`` is open
+        self.tree.update_idletasks()
+        box = self.tree.bbox(under, "#0")
+        x, y = (box[0] + em(self.tree, 2), box[1] + box[3]) if box else (0, 0)
+        self._popup(self.tree.winfo_rootx() + x, self.tree.winfo_rooty() + y)
+        return "break"
+
+    def _ancestors(self, iid: str) -> List[Tuple[str, bool]]:
+        """The row's parents in the list, innermost first, each with whether it is open."""
+        found = []
+        parent = self.tree.parent(iid)
+        while parent:
+            found.append((parent, bool(self.tree.item(parent, "open"))))
+            parent = self.tree.parent(parent)
+        return found
+
+    def _popup(self, x_root: int, y_root: int) -> None:
         menu = self.context_menu()
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
 
@@ -682,8 +779,9 @@ class MainWindow:
         """The selection's right-click menu: a group's own actions and its moves up and
         down; otherwise a destination's verification — or, for a job or several items, the
         verification of every destination they reach — the job's moves up and down, and
-        moving the selected jobs between groups. An action that cannot be taken is shown
-        disabled."""
+        moving the selected jobs between groups. Either way it holds the switch of every
+        destination the selection reaches, ticked when every one is on, which switches them
+        all. An action that cannot be taken is shown disabled."""
         selection = self.selection()
         writable = self.session.writable
         menu = tk.Menu(self.tree, tearoff=False)
@@ -694,6 +792,16 @@ class MainWindow:
                 menu.add_command(label=label, accelerator=keys, command=lambda s=step: self.move(s),
                                  state=_menu_state(can))
 
+        def switch():
+            rows = selection.destinations
+            if not rows:
+                return
+            on = tk.BooleanVar(menu, value=not switching_on(rows))
+            menu.add_checkbutton(label="Switched on", variable=on, state=_menu_state(writable),
+                                 command=lambda: self.switch(rows, on.get()))
+            menu.switched_on = on    # kept with the menu: Tk forgets a variable nothing refers to
+            menu.add_separator()
+
         if selection.single_group is not None:
             menu.add_command(label="Run now", command=self.run_now,
                              state=_menu_state(writable and bool(selection.startable)))
@@ -702,6 +810,7 @@ class MainWindow:
             menu.add_command(label="Rename...", command=self.edit_job, state=_menu_state(writable))
             menu.add_command(label="Delete group...", command=self.remove_job, state=_menu_state(writable))
             menu.add_separator()
+            switch()
             moves()
         else:
             destination = selection.single_destination
@@ -719,6 +828,7 @@ class MainWindow:
                 menu.add_command(label="Verify...", command=self.verify,
                                  state=_menu_state(writable and bool(selection.verifiable)))
                 menu.add_separator()
+            switch()
             moves()
             menu.add_separator()
             contents = self.session.contents
@@ -862,9 +972,9 @@ class MainWindow:
         selection = self.selection()
         chosen = selection.chosen
         if selection.single_group is None and len(selection.reached) == 1:
-            job_row = selection.reached[0]
-            if job_row.running:
+            if not selection.startable:
                 return
+            job_row = selection.startable[0]
             destinations = chosen.get(job_row.job_id)
             if job_row.serving(destinations).first_backups:
                 self._start_first_backups(job_row, destinations)
@@ -874,12 +984,13 @@ class MainWindow:
         if not selection.startable:
             return
         group = selection.single_group
-        plan = run_several(selection.reached, group.name if group is not None else None,
-                           turns=self.session.contents.preferences.activities.drive_turns, chosen=chosen)
+        plan = run_several(selection.runnable, group.name if group is not None else None,
+                           turns=self.session.contents.preferences.activities.drive_turns, chosen=chosen,
+                           switched_off=selection.switched_off)
         if choose(self.root, plan.title, plan.text, [("run", plan.button), ("cancel", "Cancel")], default="run",
                   cancel="cancel") != "run":
             return
-        rows = {job.job_id: job for job in selection.reached}
+        rows = {job.job_id: job for job in selection.runnable}
         started = [self._start(rows[job_id], destinations=plan.destinations.get(job_id),
                                first_backup=job_id in plan.first_backup) for job_id in plan.start]
         if any(started):

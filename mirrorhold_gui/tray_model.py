@@ -18,7 +18,8 @@ read now. Its look (``tray_look``):
   fit are counted on a last line;
 - **the menu** — *Open MirrorHold*, then for each activity a line naming it with its pause and
   cancel entries, worded as the row's buttons (``runs_model.pause_words``, ``cancel_words``),
-  then each reminder's line and the entry that dismisses them (``dismiss_words``).
+  and *Run next* where its row offers it, then each reminder's line and the entry that
+  dismisses them (``dismiss_words``).
 
 A reminder (``mirrorhold.reminders``) is what a finished activity whose notice asks something of
 the user left; the window clears them as it opens and while it has the focus, and with them the
@@ -122,7 +123,7 @@ def progress_words(panel: RunPanel, status: dict) -> str:
     1,234 entries': how far an activity has come, in the Runs tab's words."""
     if not panel.readable:
         return UNREADABLE
-    if panel.waiting or panel.cancelling is not None:
+    if panel.waiting or panel.resuming or panel.cancelling is not None:
         return _flat(panel.phase)
     percent = f"{int(100 * panel.fraction)} %" if panel.fraction is not None else ""
     if panel.paused:
@@ -186,7 +187,7 @@ def tray_look(runs: Sequence[ObservedRun], reminders: Sequence[str] = (), places
     working = [e.panel for e in entries if e.panel.readable and not e.panel.waiting]
     return TrayLook(tuple(entries), tooltip([e.line for e in entries], reminders),
                     sum(measured) / len(measured) if measured else 0.0,
-                    bool(working) and all(p.paused for p in working), tuple(reminders))
+                    bool(working) and all(p.paused or p.resuming for p in working), tuple(reminders))
 
 
 def dismiss_words(count: int) -> str:

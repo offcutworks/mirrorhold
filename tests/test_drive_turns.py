@@ -28,7 +28,7 @@ from mirrorhold.locations import RuntimeLayout, runtime_layout
 from mirrorhold.maintenance.verification import VerificationState
 from mirrorhold.maintenance.verifier import verify_destination
 from mirrorhold.records.admission import (Activity, Claim, ClaimedDrive, WaitedFor, admit, blockers, conflict,
-                                          gives_way, run_claim, verification_claim)
+                                          gives_way, place_in_line, run_claim, take_back, verification_claim)
 from mirrorhold.records.record import utc_now
 from mirrorhold.records.status import KIND_VERIFICATION, LiveStatus, Phase, StatusBoard, observe_runs
 from mirrorhold_gui.groups_model import run_several, verify_several
@@ -283,6 +283,56 @@ class TurnsConflictTest(unittest.TestCase):
         self.assertEqual(blockers(reads_spinning, [holder]), [holder])
 
 
+class PausedDrivesTest(unittest.TestCase):
+    """The maintainer's decision of 2026-11-07: a paused activity uses no drive, so nothing
+    takes turns with it; it keeps its folders, and its turn on the remotes; asked to work again
+    it holds its drives against everyone not yet admitted and waits only for what works on them."""
+
+    SPINNING = ((DD, DriveKind.SPINNING),)
+
+    def paused(self, job="holder", *, resuming=False, queued="T1", on=SPINNING):
+        return replace(busy(job, on=on, queued=queued), paused=True, resuming=resuming)
+
+    def test_what_shares_only_a_drive_with_a_paused_activity_goes_ahead(self):
+        me = busy("me", on=self.SPINNING, admitted=False, queued="T2")
+        self.assertEqual(blockers(me, [self.paused()]), [])
+        self.assertEqual(blockers(me, [busy("holder", on=self.SPINNING)])[0].job_id, "holder", "not paused, it holds them")
+
+    def test_one_job_and_overlapping_folders_stay_conflicts_while_paused(self):
+        again = busy("holder", on=self.SPINNING, admitted=False, queued="T2")
+        self.assertEqual(blockers(again, [self.paused()])[0].job_id, "holder")
+        overlapping = replace(busy("me", on=self.SPINNING, admitted=False, queued="T2"),
+                              claim=Claim((endpoint(D, "holder"),), (endpoint(D, "Mine"),),
+                                          tuple(ClaimedDrive(d, d, k) for d, k in self.SPINNING), DriveTurns.AUTOMATIC))
+        self.assertEqual(blockers(overlapping, [self.paused()])[0].job_id, "holder", "it reads what the other writes")
+
+    def test_a_paused_activity_keeps_its_turn_on_the_remotes(self):
+        paused = replace(busy("holder", on=()), paused=True,
+                         claim=Claim((endpoint(S, "holder"),), (RemoteEndpoint("cloud", "A"),)))
+        me = replace(busy("me", on=(), admitted=False, queued="T2"),
+                     claim=Claim((endpoint(S, "me"),), (RemoteEndpoint("cloud", "B"),)))
+        self.assertEqual(blockers(me, [paused]), [paused])
+
+    def test_one_that_asked_for_its_drives_back_holds_them_against_those_not_admitted(self):
+        me = busy("me", on=self.SPINNING, admitted=False, queued="T2")
+        resuming = self.paused(resuming=True)
+        self.assertEqual(blockers(me, [resuming]), [resuming])
+        self.assertTrue(resuming.holds_drives and not resuming.at_work)
+
+    def test_taking_them_back_waits_only_for_what_works_on_them(self):
+        me = self.paused("me", resuming=True)
+        working = busy("working", on=self.SPINNING, queued="T2")
+        self.assertEqual(blockers(me, [working]), [working])
+        self.assertEqual(blockers(me, [self.paused("other", queued="T2")]), [], "paused too: it uses nothing")
+        self.assertEqual(blockers(me, [self.paused("other", resuming=True, queued="T2")]), [], "the lock orders the two")
+        older = busy("older", on=self.SPINNING, admitted=False, queued="T0")
+        self.assertEqual(blockers(me, [older]), [], "admitted, it never waits for what waits for it")
+
+    def test_one_taking_its_drives_back_is_named_as_waiting_not_as_paused(self):
+        self.assertEqual(self.paused().waited_for(), WaitedFor("holder-T1", "run", "Holder", paused=True))
+        self.assertEqual(self.paused(resuming=True).waited_for(), WaitedFor("holder-T1", "run", "Holder", waiting=True))
+
+
 class RemoteTurnsTest(unittest.TestCase):
     """A remote's folder in a claim: claimed whenever selected, on no drive, and every two
     activities that reach a remote taking turns whatever the choice for drives."""
@@ -368,6 +418,71 @@ class TurnsThroughStatusTest(TempDirTest):
                  "drives": [{"drive": DD, "name": "drive D:"}], "one_per_drive": True}
         self.publish("w", None, admitted=False, doc=older)
         self.assertTrue(gives_way(self.layout, check.status))
+
+    def live_status(self, board):
+        return next(r.status for r in observe_runs(self.layout) if r.run_id == board.status.run_id)
+
+    def paused(self, letter, folder):
+        board = self.publish(letter, self.claim(folder, DriveKind.SPINNING))
+        board.status.paused = True
+        board.publish()
+        return board
+
+    def test_a_paused_activity_takes_its_drive_back_once_nothing_works_on_it(self):
+        me = self.paused("m", "Me")
+        other = self.publish("o", None, admitted=False)
+        self.assertTrue(admit(other, self.claim("Other", DriveKind.SPINNING)).admitted, "a pause frees the drive")
+        self.assertFalse(take_back(me))
+        status = self.live_status(me)
+        self.assertEqual((status["paused"], status["resuming"]), (True, True))
+        self.assertEqual(WaitedFor.from_status(status), WaitedFor(other.status.run_id, "run", "O", drive="drive D:"))
+        newcomer = self.publish("n", None, admitted=False)
+        other.status.paused = True
+        other.publish()
+        self.assertFalse(admit(newcomer, self.claim("New", DriveKind.SPINNING)).admitted, "it asked for its drive back")
+        self.assertTrue(take_back(me))
+        status = self.live_status(me)
+        self.assertEqual((status["paused"], status["resuming"], status["waiting_for"]), (False, False, None))
+
+    def test_of_two_asked_to_work_again_at_one_instant_one_goes_first(self):
+        one, two = self.paused("a", "One"), self.paused("b", "Two")
+        one.status.resuming = two.status.resuming = True
+        one.publish()
+        two.publish()
+        self.assertTrue(take_back(one))
+        self.assertFalse(take_back(two))
+        self.assertEqual(WaitedFor.from_status(self.live_status(two)).run_id, one.status.run_id)
+
+    def test_a_verification_gives_way_to_a_run_taking_its_drive_back(self):
+        drive = (ClaimedDrive(DD, "drive D:", DriveKind.SPINNING),)
+        check = self.publish("c", Claim((endpoint(S, "Work"), endpoint(D, "Backup")), (), drive, DriveTurns.AUTOMATIC),
+                             kind="verification")
+        run = self.paused("r", "Other")
+        self.assertFalse(gives_way(self.layout, check.status), "paused, the run wants nothing")
+        self.assertFalse(take_back(run))
+        self.assertTrue(gives_way(self.layout, check.status))
+
+    def test_a_paused_verification_need_not_give_way_to_what_shares_only_a_drive(self):
+        drive = (ClaimedDrive(DD, "drive D:", DriveKind.SPINNING),)
+        check = self.publish("c", Claim((endpoint(S, "Work"), endpoint(D, "Backup")), (), drive, DriveTurns.AUTOMATIC),
+                             kind="verification")
+        check.status.paused = True
+        check.publish()
+        self.publish("w", self.claim("Other", DriveKind.SPINNING), admitted=False)
+        self.assertFalse(gives_way(self.layout, check.status))
+
+    def test_a_paused_verification_gives_no_way_to_a_run_another_verification_holds_back(self):
+        def check(letter, folder):
+            return self.publish(letter, Claim((endpoint(S, folder), endpoint(D, folder)), (),
+                                              (ClaimedDrive(DD, "drive D:", DriveKind.SPINNING),),
+                                              DriveTurns.AUTOMATIC), kind="verification")
+
+        paused, working = check("c", "One"), check("d", "Two")
+        paused.status.paused = True
+        paused.publish()
+        self.publish("w", self.claim("Other", DriveKind.SPINNING), admitted=False)
+        self.assertFalse(gives_way(self.layout, paused.status))
+        self.assertTrue(gives_way(self.layout, working.status))
 
 
 class VerificationTurnsTest(TempDirTest):
@@ -501,6 +616,179 @@ class DriveTurnsWordsTest(unittest.TestCase):
                           "as Windows reports or as set in Preferences; the others run at the same time.",
                           "Verifications that use the same drive run one at a time unless it is a solid-state or "
                           "cloud drive, as Windows reports or as set in Preferences; the others run at the same time."))
+
+
+# --- a run's destinations one at a time ----------------------------------------------------
+
+DE = "disk:gpt:00000000-0000-4000-8000-0000000000d3"
+E = replace(volume(3, "E"), disk=DE)
+
+
+class DestinationAtATimeClaimTest(unittest.TestCase):
+    """The maintainer's decision of 2026-11-10: a run holds a destination's drive only while it
+    works on that destination. Its claim keeps the folders of every destination it has not
+    finished, and it reaches the remotes only while it works on a remote's folder."""
+
+    def setUp(self):
+        self.job = new_job("Work", endpoint(S, "Work"), [endpoint(D, "Backup"), endpoint(E, "Backup")])
+        self.volumes = tuple(of_kind(v, DriveKind.SPINNING) for v in (S, D, E))
+
+    def claim(self, job=None, remaining=(1, 2), working=None):
+        return run_claim(job or self.job, remaining, self.volumes, turns=DriveTurns.AUTOMATIC, working=working)
+
+    def test_a_run_working_on_one_destination_names_its_drive_alone_and_the_folders_of_all(self):
+        whole, first, second = self.claim(), self.claim(working=1), self.claim(working=2)
+        self.assertEqual([d.drive for d in whole.drives], [DS, DD, DE])
+        self.assertEqual([d.drive for d in first.drives], [DS, DD])
+        self.assertEqual([d.drive for d in second.drives], [DS, DE])
+        self.assertEqual((first.writes, second.writes), (whole.writes, whole.writes))
+        self.assertEqual(whole.writes, (endpoint(D, "Backup"), endpoint(E, "Backup")))
+        for claim in (whole, first, second):
+            self.assertEqual(Claim.from_document(json.loads(json.dumps(claim.to_document()))), claim)
+        self.assertNotIn("remote", whole.to_document(), "a claim that does not say is judged by the folders it names")
+        self.assertIs(first.to_document()["remote"], False)
+        with self.assertRaises(ValueError):
+            self.claim(remaining=(2,), working=1)
+
+    def test_what_shares_only_another_of_its_drives_works_beside_it_and_its_folders_stay_its_own(self):
+        work = Activity("w" * 32, "run", "work", "Work", "", "T1", True, False, self.claim(working=1))
+        on_e = busy("other", on=((DE, DriveKind.SPINNING),), admitted=False, queued="T2")
+        self.assertEqual(blockers(on_e, [work]), [], "the run holds the drive of the destination it works on alone")
+        on_d = busy("other", on=((DD, DriveKind.SPINNING),), admitted=False, queued="T2")
+        self.assertEqual(blockers(on_d, [work]), [work])
+        repair = replace(busy("repair", on=(), admitted=False, queued="T2", kind="repair"),
+                         claim=Claim((endpoint(S, "Work"),), (endpoint(E, "Backup"),)))
+        self.assertEqual(blockers(repair, [work]), [work], "a destination the run has yet to reach is still its own")
+
+    def test_a_run_reaches_the_remotes_only_while_it_works_on_a_remote_destination(self):
+        job = new_job("Work", endpoint(S, "Work"), [RemoteEndpoint("cloud", "Work"), endpoint(D, "Backup")])
+        on_drive, on_remote, waiting = (self.claim(job, working=2), self.claim(job, working=1), self.claim(job))
+        self.assertEqual(on_drive.writes, (RemoteEndpoint("cloud", "Work"), endpoint(D, "Backup")))
+        self.assertEqual((on_drive.reaches_remote, on_remote.reaches_remote, waiting.reaches_remote),
+                         (False, True, True))
+        self.assertEqual([d.drive for d in on_remote.drives], [DS])
+        mine = Activity("w" * 32, "run", "work", "Work", "", "T1", True, False, on_drive)
+        other = Activity("o" * 32, "run", "other", "Other", "", "T2", False, False,
+                         Claim((endpoint(S, "Other"),), (RemoteEndpoint("cloud", "Other"),)))
+        self.assertFalse(conflict(other, mine, by_drive=True), "on a drive, the run leaves the configuration alone")
+        self.assertTrue(conflict(other, replace(mine, claim=on_remote), by_drive=True))
+        inside = replace(other, claim=Claim((endpoint(S, "Other"),), (RemoteEndpoint("cloud", "Work/Inner"),)))
+        self.assertTrue(conflict(inside, mine), "the remote folder it has yet to reach is still its own")
+
+    def test_a_claim_that_does_not_say_reaches_a_remote_whenever_it_names_one(self):
+        older = {"reads": [endpoint(S, "Work").to_document()],
+                 "writes": [RemoteEndpoint("cloud", "Work").to_document()], "turns": "automatic"}
+        self.assertTrue(Claim.from_document(older).reaches_remote)
+        self.assertFalse(Claim.from_document(dict(older, remote=False)).reaches_remote)
+        self.assertIsNone(Claim.from_document(dict(older, remote="no")))
+
+
+class BegunRunOrderTest(unittest.TestCase):
+    """A run waiting between two of its destinations has begun: it goes before every activity
+    that has not, wherever their places in line, and only one that has begun counts it in its
+    place."""
+
+    SPINNING = ((DD, DriveKind.SPINNING),)
+
+    def begun(self, job="work", queued="T5"):
+        return replace(busy(job, on=self.SPINNING, admitted=False, queued=queued), begun=True)
+
+    def test_a_status_naming_a_finished_destination_is_a_run_that_has_begun(self):
+        doc = {"run_id": "r" * 32, "kind": "run", "phase": "waiting", "admitted": False, "finished": [[1, "completed"]]}
+        self.assertTrue(Activity.from_status(doc).begun)
+        self.assertFalse(Activity.from_status(dict(doc, finished=[])).begun)
+        self.assertFalse(Activity.from_status({k: v for k, v in doc.items() if k != "finished"}).begun)
+        self.assertFalse(Activity.from_status(dict(doc, kind="verification")).begun)
+
+    def test_it_goes_before_a_run_of_its_job_moved_to_the_front_and_before_any_that_has_not_begun(self):
+        begun = self.begun()
+        moved = busy("work", on=self.SPINNING, admitted=False, queued="T0")
+        self.assertEqual(blockers(moved, [begun]), [begun])
+        self.assertEqual(blockers(begun, [moved]), [])
+        earlier = busy("other", on=self.SPINNING, admitted=False, queued="T1")
+        self.assertEqual(blockers(earlier, [begun]), [begun])
+        older = self.begun("third", queued="T4")
+        self.assertEqual(blockers(begun, [older]), [older], "between two that have begun, the one queued first")
+
+    def test_it_counts_only_in_the_place_of_another_that_has_begun(self):
+        begun = self.begun()
+        unbegun = busy("other", on=self.SPINNING, admitted=False, queued="T1")
+        me = busy("me", on=self.SPINNING, admitted=False, queued="T2")
+        self.assertEqual(place_in_line(me, [begun, unbegun]), 2)
+        self.assertEqual(place_in_line(me, [begun]), 1)
+        self.assertEqual(place_in_line(self.begun("later", queued="T6"), [begun, unbegun]), 2)
+
+
+class DestinationTurnThroughStatusTest(TempDirTest):
+    """A run's turns among its destinations through the status channel: admitted on the first
+    nothing holds back, and, while every one is, waiting with all of them and holding none."""
+
+    def setUp(self):
+        super().setUp()
+        self.layout = RuntimeLayout(self.tmp)
+        self.job = new_job("Work", endpoint(S, "Work"), [endpoint(D, "Backup"), endpoint(E, "Backup")])
+        self.volumes = tuple(of_kind(v, DriveKind.SPINNING) for v in (S, D, E))
+
+    def publish(self, letter, claim, *, admitted=True, job_id=None, finished=()):
+        status = LiveStatus(letter * 32, os.getpid(), job_id or letter * 32, letter.upper(), "manual",
+                            "2026-11-10T10:00:00Z", admitted=admitted,
+                            claim=claim.to_document() if claim is not None else None,
+                            phase=Phase.COPYING if admitted else Phase.WAITING, finished=[list(f) for f in finished])
+        board = StatusBoard(self.layout, status)
+        board.open()
+        self.addCleanup(board.close)
+        return board
+
+    def on(self, letter, vol, disk):
+        """Another job's activity at work on ``vol``, a spinning drive."""
+        return self.publish(letter, Claim((endpoint(vol, letter),), (endpoint(vol, f"{letter}x"),),
+                                          (ClaimedDrive(disk, "drive", DriveKind.SPINNING),), DriveTurns.AUTOMATIC))
+
+    def asked(self, remaining=(1, 2)):
+        """The run's whole claim on ``remaining``, and its claim working on each."""
+        whole = run_claim(self.job, remaining, self.volumes, turns=DriveTurns.AUTOMATIC)
+        return whole, tuple(run_claim(self.job, remaining, self.volumes, turns=DriveTurns.AUTOMATIC, working=i)
+                            for i in remaining)
+
+    def live_status(self, board):
+        return next(r.status for r in observe_runs(self.layout) if r.run_id == board.status.run_id)
+
+    def test_it_is_admitted_on_the_first_destination_nothing_holds_back(self):
+        self.on("h", D, DD)
+        me = self.publish("m", None, admitted=False, job_id="w" * 32)
+        whole, parts = self.asked()
+        turn = admit(me, whole, any_of=parts)
+        self.assertEqual((turn.admitted, turn.chosen), (True, 1))
+        status = self.live_status(me)
+        self.assertEqual((Claim.from_document(status["claim"]), status["admitted"]), (parts[1], True))
+
+    def test_while_every_one_is_held_back_it_waits_claiming_them_all_and_holding_nothing(self):
+        holder = self.on("h", D, DD)
+        self.on("i", E, DE)
+        whole, parts = self.asked()
+        me = self.publish("m", parts[0], admitted=True, job_id="w" * 32, finished=((3, "completed"),))
+        turn = admit(me, whole, any_of=parts)
+        self.assertEqual((turn.admitted, turn.waits_for.run_id), (False, holder.status.run_id))
+        status = self.live_status(me)
+        self.assertEqual((Claim.from_document(status["claim"]), status["admitted"]), (whole, False))
+        self.assertEqual(WaitedFor.from_status(status), WaitedFor(holder.status.run_id, "run", "H", drive="drive D:"))
+        holder.close()
+        turn = admit(me, whole, any_of=parts)
+        self.assertEqual((turn.admitted, turn.chosen), (True, 0))
+
+    def test_a_run_of_its_job_moved_to_the_front_waits_behind_one_that_has_begun(self):
+        holder = self.on("h", E, DE)
+        whole, parts = self.asked((2,))
+        first = self.publish("f", whole, admitted=False, job_id="w" * 32, finished=((1, "completed"),))
+        second = self.publish("s", None, admitted=False, job_id="w" * 32)
+        second.status.queued = "2026-01-01T00:00:00.000000Z"
+        alone, (part,) = self.asked((1,))
+        turn = admit(second, alone, any_of=(part,))
+        self.assertEqual((turn.admitted, turn.waits_for.run_id), (False, first.status.run_id))
+        status = self.live_status(second)
+        self.assertEqual((WaitedFor.from_status(status).waiting, status["place"]), (True, 1))
+        holder.close()
+        self.assertTrue(admit(first, whole, any_of=parts).admitted)
 
 
 if __name__ == "__main__":

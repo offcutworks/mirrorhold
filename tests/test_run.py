@@ -1,15 +1,15 @@
 """The run end to end, on temporary folders, through the pinned engine.
 
-Each test is one of the run's designed outcomes, injected as a failure or an
-event: a first run waiting for confirmation, removals landing in a dated versions
-batch, an unlistable source folder, a long-held file, the engine killed mid-copy, the
-four kinds of mass removal and a lost file signature held while additions are copied,
-a tree reorganised by renames, pause and resume, graceful and immediate cancel, runs at
-the same time and runs waiting their turn, runs on one drive one after the other — once
-through this machine's real volume source. The last classes follow the live path: an
-engine that must not outlive its core, and the command line through ``python -m
-mirrorhold`` on this machine's real volume source (read-only) with a store in a
-temporary folder.
+Each test is one of the run's designed outcomes, injected as a failure or an event: the
+destinations a run serves by their switches, a first run waiting for confirmation,
+removals landing in a dated versions batch, an unlistable source folder, a long-held
+file, the engine killed mid-copy, the four kinds of mass removal and a lost file
+signature held while additions are copied, a tree reorganised by renames, pause and
+resume, graceful and immediate cancel, runs at the same time and runs waiting their
+turn, runs on one drive one after the other — once through this machine's real volume
+source. The last classes follow the live path: an engine that must not outlive its core,
+and the command line through ``python -m mirrorhold`` on this machine's real volume
+source (read-only) with a store in a temporary folder.
 
 Volumes are temporary folders mapped as volumes (``support.volume``); nothing touches a
 real volume but through a temporary folder on the system drive."""
@@ -30,7 +30,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from support import GIB, PROJECT, TempDirTest, endpoint, held, job_file_saver, live_activity, result_of, volume
+from support import (GIB, PROJECT, TempDirTest, endpoint, every_destination, held, job_file_saver, live_activity,
+                     result_of, volume)
 from test_engine_contract import (CARRIED_NAMES, INSTALLED, MiB, current_user, drop_backup_privileges, growing_partial,
                                   icacls, partials, wait_for, write_verbatim)
 
@@ -38,19 +39,21 @@ from mirrorhold.endpoints.cloud import SyncKind, SyncRoot
 from mirrorhold.endpoints.marker import Marker, MarkerState, check_marker, marker_check, write_marker
 from mirrorhold.endpoints.resolution import endpoint_from_path
 from mirrorhold.endpoints.shared import read_shared, shared_path
-from mirrorhold.endpoints.volumes import FixedVolumeSource, default_volume_source, drive_name, find_by_mount
-from mirrorhold.engine.rclone import Engine, TransferStats, _Windows, open_engine
-from mirrorhold.jobs.model import Activities, Destination, DriveTurns, HoldThresholds, Preferences, new_job
+from mirrorhold.endpoints.volumes import DriveKind, FixedVolumeSource, default_volume_source, drive_name, find_by_mount
+from mirrorhold.engine.rclone import (IMMEDIATE_STOP_EXIT, Engine, EngineError, StopKind, TransferReport, TransferStats,
+                                      _Windows, open_engine)
+from mirrorhold.jobs.model import Activities, Destination, DriveTurns, HoldThresholds, Preferences, Triggers, new_job
 from mirrorhold.jobs.store import ConfigStore, LoadStatus, StoreContents
 from mirrorhold.locations import RuntimeLayout, runtime_layout
 from mirrorhold.maintenance.cleanup import batch_time
 from mirrorhold.planning.listing import Side, list_tree
 from mirrorhold.planning.plan import build_plan
 from mirrorhold.records import diagnostics
-from mirrorhold.records.admission import WaitedFor
-from mirrorhold.records.record import Outcome, read_records
-from mirrorhold.records.status import CancelMode, LiveStatus, Phase, StatusBoard, Wanted, observe_runs, request
-from mirrorhold.run import apply
+from mirrorhold.records.admission import Claim, ClaimedDrive, WaitedFor
+from mirrorhold.records.record import Outcome, read_records, utc_now
+from mirrorhold.records.status import CancelMode, LiveStatus, Phase, StatusBoard, Wanted, observe_runs, request, run_next
+from mirrorhold.records import admission
+from mirrorhold.run import apply, runner
 from mirrorhold.run.apply import PASSED_OVER, VersionsBatch, apply_pair
 from mirrorhold.run.control import RunControl, StatusPump
 from mirrorhold.run.gate import judge
@@ -58,6 +61,7 @@ from mirrorhold.run.confirmation import Content
 from mirrorhold.run.launch import EXIT_STARTED_NORMALLY, run_arguments
 from mirrorhold.run.put_back import newest_batch, put_back
 from mirrorhold.run.runner import RunError, RunOptions, preview_job, run_job, ticket_for
+from mirrorhold.storage.drive import DriveStorage
 
 WINDOWS = sys.platform == "win32"
 needs_engine = unittest.skipUnless(INSTALLED, "the pinned engine is not installed")
@@ -722,11 +726,54 @@ class PairOutcomeTest(RunCase):
         self.assertEqual((record.outcome, record.reasons), (Outcome.STOPPED, ("marker-mismatch",)))
         self.assertEqual(tree(self.dst), ["theirs.txt"])
 
-    def test_an_unattended_run_of_a_disabled_job_does_nothing(self):
+    def test_an_unattended_run_of_a_job_with_every_destination_off_does_nothing(self):
         write(self.src, "a.txt", "a")
-        self.store.save(StoreContents((replace(self.job, enabled=False),)))
+        self.store.save(StoreContents((every_destination(self.job, False),)))
         result = self.run_now(unattended=True)
         self.assertEqual((result.disabled, result.records), (True, ()))
+        self.assertEqual(read_records(self.layout, self.job.job_id), [])
+
+
+class DestinationSwitchRunTest(RunCase):
+    """A run that names no destination serves those switched on; one named runs whatever its
+    switch; an unattended run never serves one switched off."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = self.vol_d / "Other"
+        two = new_job("Work", endpoint(self.s, "Work"), [endpoint(self.d, "Backup"), endpoint(self.d, "Other")],
+                      holds=self.holds)
+        self.job = replace(two, destinations=(two.destinations[0], replace(two.destinations[1], switched_on=False)))
+        self.store.save(StoreContents((self.job,)))
+        write(self.src, "a.txt", "a")
+
+    def switched_off_both(self):
+        self.store.save(StoreContents((replace(self.job, destinations=tuple(
+            replace(d, switched_on=False) for d in self.job.destinations)),)))
+
+    def test_a_run_of_the_job_serves_only_the_destinations_switched_on(self):
+        record = self.only(self.run_now(first_backup=True))
+        self.assertEqual((record.destination_index, record.outcome), (1, Outcome.COMPLETED))
+        self.assertEqual(tree(self.dst), ["a.txt"])
+        self.assertFalse(self.other.exists())
+
+    def test_a_destination_named_runs_though_it_is_switched_off(self):
+        record = self.only(self.run_now(destinations=(2,), first_backup=True))
+        self.assertEqual((record.destination_index, record.outcome), (2, Outcome.COMPLETED))
+        self.assertEqual(tree(self.other), ["a.txt"])
+
+    def test_an_unattended_run_never_serves_a_destination_switched_off(self):
+        result = self.run_now(destinations=(2,), unattended=True)
+        self.assertEqual((result.disabled, result.records), (True, ()))
+        self.assertFalse(self.other.exists())
+
+    def test_with_every_destination_switched_off_an_unattended_run_does_nothing_and_a_run_of_the_job_is_refused(self):
+        self.switched_off_both()
+        result = self.run_now(unattended=True)
+        self.assertEqual((result.disabled, result.records), (True, ()))
+        with self.assertRaises(RunError) as ctx:
+            self.run_now(first_backup=True)
+        self.assertIn("every destination of the job is switched off", str(ctx.exception))
         self.assertEqual(read_records(self.layout, self.job.job_id), [])
 
 
@@ -1396,6 +1443,44 @@ class ParallelRunsTest(RunCase):
         self.assertEqual((first.outcome, second.outcome), (Outcome.HELD, Outcome.HELD))  # first runs, unconfirmed
         self.assertGreaterEqual(second.started, first.ended)
 
+    def test_an_unattended_run_that_waits_ends_when_the_job_no_longer_runs_by_itself(self):
+        holder = live_activity(self.layout, "h" * 32, job_name="Holder", reads=[endpoint(self.d, "Elsewhere")],
+                               writes=[endpoint(self.s, "Work")])
+        self.addCleanup(holder.close)
+        for changed, words in ((every_destination(self.job, False), "every destination of the job is switched off now"),
+                               (replace(self.job, triggers=Triggers(False, None)),
+                                "the job no longer runs on a schedule now")):
+            self.store.save(StoreContents((replace(self.job, triggers=Triggers(False, "daily 21:00")),)))
+            work = self.start(self.job, unattended=True, automatic="schedule")
+            self.waiting_for(self.job, holder.status.run_id)
+            self.store.save(StoreContents((changed,)))
+            record = self.only(self.finish(*work))
+            self.assertEqual((record.outcome, record.reasons, record.detail),
+                             (Outcome.CANCELLED, ("cancelled-while-waiting",), words))
+
+    def test_a_run_that_waits_ends_when_what_it_would_serve_is_switched_off_meanwhile(self):
+        holder = live_activity(self.layout, "h" * 32, job_name="Holder", reads=[endpoint(self.d, "Elsewhere")],
+                               writes=[endpoint(self.s, "Work")])
+        self.addCleanup(holder.close)
+        two = new_job("Work", endpoint(self.s, "Work"), [endpoint(self.d, "Backup"), endpoint(self.d, "Second")],
+                      holds=self.holds, triggers=Triggers(True, None))
+        two = replace(two, job_id=self.job.job_id)
+        first_off = replace(two, destinations=(replace(two.destinations[0], switched_on=False), two.destinations[1]))
+        all_off = replace(two, destinations=tuple(replace(d, switched_on=False) for d in two.destinations))
+        for options, changed in ((dict(destinations=(1,), unattended=True, automatic="arrival"), first_off),
+                                 (dict(first_backup=True), all_off)):
+            with self.subTest(options=options):
+                self.store.save(StoreContents((two,)))
+                work = self.start(two, **options)
+                self.waiting_for(two, holder.status.run_id)
+                self.store.save(StoreContents((changed,)))
+                result = self.finish(*work)
+                self.assertTrue(result.records)
+                self.assertEqual({(r.outcome, r.reasons, r.detail) for r in result.records},
+                                 {(Outcome.CANCELLED, ("cancelled-while-waiting",),
+                                   "every destination it would serve is switched off now")})
+                self.assertEqual(tree(self.dst), [])
+
     def test_a_waiting_run_survives_the_job_file_saved_by_another_process(self):
         write(self.src, "a.txt", "a")
         holder = live_activity(self.layout, "h" * 32, job_name="Holder", reads=[endpoint(self.d, "Elsewhere")],
@@ -1507,8 +1592,7 @@ class OneDriveAtATimeTest(RunCase):
                        if r.alive and r.status.get("engine_pid") and r.status.get("admitted")}
             return {self.job.job_id, self.apart.job_id} <= copying
 
-        # Paused, Work keeps its turn and its drives as a working run does, and cannot end
-        # before Apart has been judged beside it.
+        # Paused, Work cannot end before Apart has been judged beside it.
         request(self.layout, working["run_id"], pause=True)
         try:
             held = self.live(lambda st: st.get("run_id") == working["run_id"]
@@ -1520,6 +1604,57 @@ class OneDriveAtATimeTest(RunCase):
             request(self.layout, working["run_id"], pause=False)
         self.assertEqual(self.only(self.finish(*work)).outcome, Outcome.COMPLETED)
         self.assertEqual(self.only(self.finish(*apart)).outcome, Outcome.COMPLETED)
+
+    def test_a_pause_lets_what_shares_only_its_drive_start_and_a_resume_waits_for_that_to_end(self):
+        self.seed({"a.txt": "a"})
+        write(self.src, "video.bin", os.urandom(16 * MiB))
+        write(self.vol_s / "Photos", "raw.bin", os.urandom(12 * MiB))
+        work = self.in_background(bandwidth_limit="2M")
+        working = self.live(lambda st: st.get("job_id") == self.job.job_id and st.get("engine_pid"))
+        photos = self.start(self.photos, first_backup=True, bandwidth_limit="2M")
+        self.of(self.photos, lambda st: st.get("phase") == "waiting" and st.get("waiting_for"))
+        request(self.layout, working["run_id"], pause=True)
+        self.of(self.photos, lambda st: st.get("engine_pid"))
+        request(self.layout, working["run_id"], pause=False)
+        resuming = self.of(self.job, lambda st: st.get("resuming"))
+        self.assertTrue(resuming["paused"], "it stays paused until it has its drives back")
+        self.assertEqual(WaitedFor.from_status(resuming).job_name, "Photos")
+        self.assertEqual(self.only(self.finish(*photos)).outcome, Outcome.COMPLETED)
+        self.assertEqual(self.only(self.finish(*work)).outcome, Outcome.COMPLETED)
+        self.assertEqual(tree(self.dst), tree(self.src))
+        self.assertEqual((self.dst / "video.bin").read_bytes(), (self.src / "video.bin").read_bytes())
+
+    def test_a_run_of_one_job_never_passes_a_paused_run_of_that_job(self):
+        self.seed({"a.txt": "a"})
+        write(self.src, "video.bin", os.urandom(8 * MiB))
+        work = self.in_background(bandwidth_limit="2M")
+        working = self.live(lambda st: st.get("engine_pid"))
+        request(self.layout, working["run_id"], pause=True)
+        self.live(lambda st: st.get("run_id") == working["run_id"] and st.get("paused"))
+        second = self.in_background()
+        waiting = self.live(lambda st: st.get("phase") == "waiting" and (st.get("waiting_for") or {}).get("paused"))
+        self.assertEqual(waiting["waiting_for"]["run_id"], working["run_id"])
+        request(self.layout, working["run_id"], pause=False)
+        self.assertEqual(self.only(self.finish(*work)).outcome, Outcome.COMPLETED)
+        self.assertEqual(self.only(self.finish(*second)).outcome, Outcome.COMPLETED)
+
+    def test_a_waiting_run_moved_to_the_front_goes_before_those_queued_earlier(self):
+        write(self.vol_s / "Photos", "p.txt", "p")
+        write(self.vol_s / "Third", "t.txt", "t")
+        holder = live_activity(self.layout, "h" * 32, job_name="Holder", reads=[endpoint(self.d, "Elsewhere")],
+                               writes=[endpoint(self.s)])
+        self.addCleanup(holder.close)
+        photos = self.start(self.photos)
+        self.of(self.photos, lambda st: st.get("phase") == "waiting" and st.get("place") == 1)
+        third = self.start(self.third)
+        later = self.of(self.third, lambda st: st.get("phase") == "waiting" and st.get("place") == 2)
+        run_next(self.layout, later["run_id"])
+        self.of(self.third, lambda st: st.get("place") == 1)
+        self.of(self.photos, lambda st: st.get("place") == 2)
+        holder.close()
+        first, second = self.only(self.finish(*third)), self.only(self.finish(*photos))
+        self.assertEqual((first.outcome, second.outcome), (Outcome.HELD, Outcome.HELD))    # first runs, unconfirmed
+        self.assertGreaterEqual(second.started, first.ended)
 
     def test_two_volumes_on_one_disk_are_one_drive(self):
         disk = "disk:gpt:00000000-0000-4000-8000-0000000000d1"
@@ -1534,6 +1669,158 @@ class OneDriveAtATimeTest(RunCase):
         done = self.only(self.finish(*work))
         after = self.only(self.finish(*apart))
         self.assertEqual((after.outcome, after.started >= done.ended), (Outcome.COMPLETED, True))
+
+
+class DestinationsOneAtATimeTest(RunCase):
+    """The maintainer's decision of 2026-11-10, at the default choice: a run holds a
+    destination's drive only while it works on that destination, so another job's run on its
+    other drive works meanwhile; a destination whose drive another holds is left for later,
+    so the destinations need not finish in their order; between two of them the run waits
+    holding nothing, said as a waiting run says it, and every run that has not begun waits
+    behind it.
+
+    Work copies S\\Work to D\\Backup and E\\Backup; Apart copies F\\Apart to E\\Apart."""
+
+    def setUp(self):
+        super().setUp()
+        self.vol_e, self.vol_f = self.tmp / "volE", self.tmp / "volF"
+        for folder in (self.vol_e, self.vol_f / "Apart"):
+            folder.mkdir(parents=True)
+        self.e = volume(3, mounts=(str(self.vol_e) + "\\",), label="E")
+        self.f = volume(4, mounts=(str(self.vol_f) + "\\",), label="F")
+        self.volumes = FixedVolumeSource((self.s, self.d, self.e, self.f))
+        self.job = new_job("Work", endpoint(self.s, "Work"), [endpoint(self.d, "Backup"), endpoint(self.e, "Backup")],
+                           holds=self.holds)
+        self.apart = new_job("Apart", endpoint(self.f, "Apart"), [endpoint(self.e, "Apart")], holds=self.holds)
+        self.store.save(StoreContents((self.job, self.apart)))
+
+    def start(self, job, **options):
+        box = {}
+
+        def target():
+            try:
+                box["result"] = run_job(self.store, job.job_id, RunOptions(**options), volume_source=self.volumes,
+                                        sync_roots=())
+            except BaseException as exc:  # handed to the test thread by finish()
+                box["error"] = exc
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread, box
+
+    def of(self, job, predicate, timeout=60):
+        return self.live(lambda st: st.get("job_id") == job.job_id and predicate(st), timeout)
+
+    def holding(self, vol):
+        """Another job's activity at work on ``vol``, naming its drive as a claim does."""
+        drive = ClaimedDrive(vol.drive, drive_name(self.volumes.scan().volumes, vol.drive), DriveKind.UNKNOWN)
+        claim = Claim((endpoint(vol, "Elsewhere"),), (endpoint(vol, "ElsewhereCopy"),), (drive,), DriveTurns.AUTOMATIC)
+        status = LiveStatus(os.urandom(16).hex(), os.getpid(), "h" * 32, "Holder", "manual", utc_now(), admitted=True,
+                            claim=claim.to_document(), phase=Phase.COPYING)
+        board = StatusBoard(self.layout, status)
+        board.open()
+        self.addCleanup(board.close)
+        return board
+
+    def between(self, job):
+        """The status of ``job``'s run once it waits for a turn after a destination it finished."""
+        return self.of(job, lambda st: st.get("phase") == "waiting" and st.get("waiting_for") and st.get("finished"))
+
+    @staticmethod
+    def worked(records):
+        return [(r.destination_index, r.outcome, r.reasons) for r in records]
+
+    def test_a_destination_whose_drive_another_holds_is_left_for_later(self):
+        write(self.src, "a.txt", "a")
+        holder = self.holding(self.d)
+        work = self.start(self.job, first_backup=True)
+        waiting = self.between(self.job)
+        self.assertEqual(waiting["finished"], [[2, Outcome.COMPLETED.value]])
+        self.assertEqual((waiting["pair_index"], waiting["marker_id"], waiting["admitted"]), (0, None, False))
+        self.assertEqual(WaitedFor.from_status(waiting),
+                         WaitedFor(holder.status.run_id, "run", "Holder", drive="drive 'D'"))
+        self.assertEqual(Claim.from_document(waiting["claim"]).writes, (endpoint(self.d, "Backup"),))
+        holder.close()
+        records = self.finish(*work).records
+        self.assertEqual(self.worked(records), [(2, Outcome.COMPLETED, ()), (1, Outcome.COMPLETED, ())])
+        self.assertEqual((tree(self.dst), tree(self.vol_e / "Backup")), (tree(self.src), tree(self.src)))
+
+    def test_another_jobs_run_on_its_other_drive_works_while_it_works_on_one(self):
+        write(self.src, "video.bin", os.urandom(16 * MiB))
+        write(self.vol_f / "Apart", "raw.bin", os.urandom(4 * MiB))
+        work = self.start(self.job, first_backup=True, bandwidth_limit="2M")
+        self.of(self.job, lambda st: st.get("engine_pid") and st.get("pair_index") == 1)
+        apart = self.start(self.apart, first_backup=True, bandwidth_limit="2M")
+
+        def together():
+            live = {r.status.get("job_id"): r.status for r in observe_runs(self.layout) if r.alive}
+            mine, other = live.get(self.job.job_id), live.get(self.apart.job_id)
+            if not (mine and other and mine.get("admitted") and mine.get("pair_index") == 1 and other.get("admitted")):
+                return None
+            return mine
+
+        working = wait_for(together, timeout=60)
+        self.assertIsNotNone(working, "Apart waited for the drive of a destination Work had yet to reach")
+        claim = Claim.from_document(working["claim"])
+        self.assertEqual([d.drive for d in claim.drives], [self.s.drive, self.d.drive])
+        self.assertEqual(claim.writes, (endpoint(self.d, "Backup"), endpoint(self.e, "Backup")))
+        self.assertEqual(self.only(self.finish(*apart)).outcome, Outcome.COMPLETED)
+        records = self.finish(*work).records
+        self.assertEqual(self.worked(records), [(1, Outcome.COMPLETED, ()), (2, Outcome.COMPLETED, ())])
+        self.assertEqual((self.vol_e / "Backup" / "video.bin").read_bytes(), (self.src / "video.bin").read_bytes())
+
+    def test_a_run_of_its_job_moved_to_the_front_waits_for_one_between_two_of_its_destinations(self):
+        write(self.src, "a.txt", "a")
+        holder = self.holding(self.e)
+        first = self.start(self.job, first_backup=True)
+        between = self.between(self.job)
+        self.assertEqual(between["finished"], [[1, Outcome.COMPLETED.value]])
+        second = self.start(self.job, destinations=(1,))
+        behind = self.of(self.job, lambda st: st.get("run_id") != between["run_id"] and st.get("waiting_for"))
+        run_next(self.layout, behind["run_id"])
+        moved = self.of(self.job, lambda st: st.get("run_id") == behind["run_id"] and st.get("place")
+                        and st.get("queued") < between["queued"])
+        self.assertEqual((WaitedFor.from_status(moved), moved["place"]),
+                         (WaitedFor(between["run_id"], "run", "Work", waiting=True), 1))
+        holder.close()
+        done = self.finish(*first).records
+        after = self.only(self.finish(*second))
+        self.assertEqual(self.worked(done), [(1, Outcome.COMPLETED, ()), (2, Outcome.COMPLETED, ())])
+        self.assertEqual(after.outcome, Outcome.COMPLETED)
+        self.assertGreaterEqual(after.started, done[-1].ended)
+
+    def test_a_cancel_while_it_waits_between_two_destinations_records_the_rest_cancelled(self):
+        write(self.src, "a.txt", "a")
+        self.holding(self.e)
+        work = self.start(self.job, first_backup=True)
+        between = self.between(self.job)
+        request(self.layout, between["run_id"], cancel=CancelMode.GRACEFUL)
+        records = self.finish(*work).records
+        self.assertEqual(self.worked(records), [(1, Outcome.COMPLETED, ()), (2, Outcome.CANCELLED, ("cancelled",))])
+
+    def test_it_holds_nothing_from_the_moment_it_asks_again_and_withdraws_its_claim_when_it_stops(self):
+        write(self.src, "a.txt", "a")
+        self.holding(self.e)
+        asked, recorded = [], []
+
+        def asking(board, claim, **options):
+            asked.append(board.status.admitted)
+            return admission.admit(board, claim, **options)
+
+        def recording(run, index, outcome, **fields):
+            recorded.append((index, run.status.claim, run.status.admitted))
+            return original(run, index, outcome, **fields)
+
+        original = runner._Run.record
+        with mock.patch.object(runner, "admit", asking), mock.patch.object(runner._Run, "record", recording):
+            work = self.start(self.job, first_backup=True)
+            between = self.between(self.job)
+            request(self.layout, between["run_id"], cancel=CancelMode.GRACEFUL)
+            self.finish(*work)
+        self.assertFalse(any(asked), "it asks holding nothing, the first time and between two destinations")
+        self.assertGreater(len(asked), 1)
+        self.assertIsNotNone(recorded[0][1], "destination 1 is recorded under its turn")
+        self.assertEqual(recorded[1:], [(2, None, False)], "the cancelled one, with its claim withdrawn")
 
 
 @needs_engine
@@ -1784,6 +2071,156 @@ class ApplyStepTest(TempDirTest):
         self.assertTrue((self.dst / result.versions_batch / "Old" / "a.txt").is_file())
 
 
+class _CountingDrive(DriveStorage):
+    """A drive's storage that counts the operations asked of it — on a remote each is at
+    least one request to the service — and calls ``on_ask`` before each. An operation the
+    storage makes of itself is counted once, as the one it serves."""
+
+    asked = 0
+    depth = 0
+    on_ask = staticmethod(lambda: None)
+
+
+def _counted(name):
+    def operation(self, *args, **kwargs):
+        if self.depth == 0:
+            self.asked += 1
+            self.on_ask()
+        self.depth += 1
+        try:
+            return getattr(DriveStorage, name)(self, *args, **kwargs)
+        finally:
+            self.depth -= 1
+    return operation
+
+
+for _name in ("entry", "file_entry", "exists", "is_folder", "entries", "move", "make_folder", "make_management_folder",
+              "remove_file", "remove_empty_tree", "delete_tree", "measure", "read_file", "write_file"):
+    setattr(_CountingDrive, _name, _counted(_name))
+
+
+class _SetAsideAndStopped:
+    """A stand-in for the engine's transfer, stopped at once while it worked: it set aside
+    the destination copies of ``moved`` into the batch, as the engine does before it copies
+    a changed file, and replaced only ``copied`` of them. ``on_start``: the user's cancel,
+    asked while it worked."""
+
+    pid = os.getpid()
+    suspended = False
+
+    def __init__(self, source_root, destination_root, backup_dir, moved, copied, on_start):
+        for relative in moved:
+            kept = Path(backup_dir) / relative
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(Path(destination_root) / relative, kept)
+        for relative in copied:
+            shutil.copy2(Path(source_root) / relative, Path(destination_root) / relative)
+        self._report = TransferReport(IMMEDIATE_STOP_EXIT, StopKind.IMMEDIATE, {r: 1 for r in copied}, tuple(moved))
+        on_start()
+
+    def poll(self):
+        return IMMEDIATE_STOP_EXIT
+
+    def stats(self):
+        return None
+
+    def stop_now(self):
+        pass
+
+    def report(self):
+        return self._report
+
+
+class StoppedCopyCleanupTest(TempDirTest):
+    """After an engine ended partway — here a cancel at once — the previous copies it set
+    aside and did not replace are moved back to their places, found from what it reports it
+    moved: the destination is asked about those files alone, never about each changed file
+    the engine did not reach, which on a remote is one request to the service apiece."""
+
+    CHANGED = 300
+
+    def setUp(self):
+        super().setUp()
+        self.src, self.dst = self.tmp / "s", self.tmp / "d"
+        for i in range(self.CHANGED):
+            relative = f"sub{i % 7}\\c{i}.txt"
+            write(self.src, relative, f"new {i}")
+            old = write(self.dst, relative, f"old {i}")
+            os.utime(old, ns=(1_600_000_000_000_000_000,) * 2)
+        self.status = LiveStatus("a" * 32, os.getpid(), "j" * 32, "Job", "manual", "2026-11-07T22:00:00Z", pair_index=1)
+        self.board = StatusBoard(RuntimeLayout(self.tmp / "state"), self.status)
+        self.board.open()
+        self.addCleanup(self.board.close)
+        self.control = RunControl(self.status)
+        self.pump = StatusPump(self.board, self.control)
+
+    def stop_at_once(self, moved, copied, *, before=lambda storage: None):
+        plan = build_plan(list_tree(self.src, Side.SOURCE, drive_root=False),
+                          list_tree(self.dst, Side.DESTINATION, drive_root=False), trust_temporaries=True)
+        decision = judge(plan, holds=HoldThresholds(count_floor=1000, percent=100, share=None), first_run=False,
+                         destination=volume(2, letter="E"))
+        self.assertEqual(len(plan.changed), self.CHANGED)
+        self.assertTrue(decision.applies_removals)
+        storage = _CountingDrive(self.dst)
+        batch = VersionsBatch(storage, datetime.now(timezone.utc))
+        seen = []
+        storage.on_ask = lambda: seen.append((self.status.phase, self.status.examined, self.status.to_examine))
+
+        def transfer(engine, source_root, destination_root, files, **options):
+            stopped = _SetAsideAndStopped(source_root, destination_root, options["backup_dir"], moved, copied,
+                                          lambda: self.control.update(Wanted(cancel=CancelMode.IMMEDIATE)))
+            before(storage)
+            storage.asked = 0
+            return stopped
+
+        with mock.patch.object(apply, "Transfer", transfer):
+            result = apply_pair(plan, decision, source_root=self.src, destination_root=storage, batch=batch,
+                                engine=Engine(self.tmp / "none.exe", "v0"), control=self.control, pump=self.pump,
+                                list_path=self.tmp / "state" / "list.files")
+        return result, storage.asked, seen, batch
+
+    def test_an_immediate_cancel_asks_the_destination_only_about_what_the_engine_set_aside(self):
+        moved = [f"sub{i % 7}\\c{i}.txt" for i in (3, 40, 41, 150, 299, 7)]
+        copied = moved[4:]
+        result, asked, seen, batch = self.stop_at_once(moved, copied)
+        self.assertEqual((result.cancelled, result.errors, result.restored, result.moved_to_versions),
+                         (CancelMode.IMMEDIATE, [], 4, 2))
+        self.assertLessEqual(asked, 3 * 4 + 2, "a look and a move for each of the four set aside, and the batch's "
+                                               "own look; nothing for the 294 changed files the engine never reached")
+        for i in range(self.CHANGED):
+            relative = f"sub{i % 7}\\c{i}.txt"
+            self.assertEqual((self.dst / relative).read_text(), f"new {i}" if relative in copied else f"old {i}")
+        self.assertEqual(sorted(tree(self.dst / batch.folder)), sorted(copied))
+        moving_back = [s[1:] for s in seen if s[0] is Phase.FINISHING and s[2]]
+        self.assertEqual(moving_back, [(n, 4) for n in range(4) for _look_and_move in (0, 1)])
+        self.assertEqual((self.status.phase, self.status.examined, self.status.to_examine), (Phase.COPYING, 0, 0),
+                         "the step in progress before it is shown again")
+
+    def test_a_copy_already_at_its_place_is_never_replaced_by_the_one_set_aside(self):
+        moved = ["sub3\\c3.txt"]
+
+        def landed_unreported(storage):
+            write(self.dst, moved[0], "new 3")          # the copy finished, its line never logged
+
+        result, _asked, _seen, batch = self.stop_at_once(moved, [], before=landed_unreported)
+        self.assertEqual((result.restored, result.moved_to_versions, result.errors), (0, 1, []))
+        self.assertEqual((self.dst / moved[0]).read_text(), "new 3")
+        self.assertEqual((self.dst / batch.folder / moved[0]).read_text(), "old 3")
+
+    def test_a_previous_copy_that_cannot_go_back_is_reported(self):
+        moved = ["sub3\\c3.txt"]
+
+        def folder_gone(storage):
+            shutil.rmtree(self.dst / "sub3")
+
+        result, _asked, _seen, batch = self.stop_at_once(moved, [], before=folder_gone)
+        self.assertEqual((result.restored, result.moved_to_versions), (0, 1))
+        self.assertEqual(len(result.errors), 1)
+        self.assertTrue(result.errors[0].startswith("sub3\\c3.txt: its previous copy could not be moved back out of "
+                                                    "versions"), result.errors)
+        self.assertEqual((self.dst / batch.folder / moved[0]).read_text(), "old 3")
+
+
 class _Engine:
     """A stand-in for a running engine: its figures as the test sets them, a pause, and the
     stop the bound asks for."""
@@ -1866,6 +2303,30 @@ class StallBoundTest(unittest.TestCase):
         minutes, why = self.follow(unreadable, lambda now: None)
         self.assertLessEqual(minutes, 32)
         self.assertIsNotNone(why)
+
+    def test_an_engine_that_could_not_be_resumed_stays_shown_as_paused(self):
+        engine, result = _Engine(), apply.ApplyResult()
+        status = LiveStatus("a" * 32, os.getpid(), "j" * 32, "Job", "manual", "2026-10-21T10:00:00Z")
+        control = _Still()
+        control.wanted = Wanted(paused=True)
+        control.pause_wanted = lambda: control.wanted.paused
+
+        def refuse():
+            raise EngineError("refused")
+
+        engine.suspend, engine.resume = lambda: setattr(engine, "suspended", True), refuse
+        turns = iter(range(100))
+
+        def clock():
+            turn = next(turns)
+            if turn == 2:
+                control.wanted = Wanted()
+            engine.stopped = turn == 4
+            return float(turn)
+
+        apply._follow(engine, control, status, result, clock=clock)
+        self.assertTrue(status.paused)
+        self.assertEqual(result.errors, ["the engine could not be resumed: refused"])
 
     def test_time_the_computer_slept_is_not_counted(self):
         engine = _Engine()

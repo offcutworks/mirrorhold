@@ -6,11 +6,12 @@ path and its unlock — nothing, the user's own command, or this copy's ``unlock
 where the password is remembered (``invocation.unlock_command``). ``open_session`` starts
 the engine with it, refusing at once, with why, when no configuration is named, the
 remembered password is missing, the engine cannot be used or the configuration cannot be
-opened. ``look`` asks the engine about one remote folder; ``reach`` does both and keeps
-the session open for a run or a preview, whose remote folders it then serves as storage
-(``Reached``), and ``gather`` does both for validation alone. ``folders`` lists the folders
-inside a remote's folder, and ``has_a_password`` and ``remember_password`` remember the
-configuration's password, for the command line and the window alike.
+opened, and tells each request the engine leaves unanswered to the process's diagnostic log
+(``records.diagnostics``). ``look`` asks the engine about one remote folder; ``reach`` does
+both and keeps the session open for a run or a preview, whose remote folders it then serves
+as storage (``Reached``), and ``gather`` does both for validation alone. ``folders`` lists
+the folders inside a remote's folder, and ``has_a_password`` and ``remember_password``
+remember the configuration's password, for the command line and the window alike.
 
 A failure to reach a remote is told apart from the service's own refusal by the engine's
 reason (``engine.remote.unreachable``): the first waits, as a drive not attached does; the
@@ -28,6 +29,7 @@ from ..engine.remote import RemoteError, RemoteSession, unreachable
 from ..invocation import unlock_command
 from ..jobs.model import Preferences, RemoteSettings, Unlock
 from ..locations import runtime_layout
+from ..records import diagnostics
 from ..storage.remote import RemoteStorage
 from . import seal
 from .facts import Reach, RemoteFacts, RemoteSetup, SetupState
@@ -77,7 +79,7 @@ def open_session(preferences: Preferences, store_path: Path, *, engine: Optional
     except EngineError as exc:
         raise RemoteSetupError(SetupState.UNUSABLE, f"the sync engine cannot be used: {exc}") from None
     try:
-        return RemoteSession(engine, configuration)
+        return RemoteSession(engine, configuration, note=diagnostics.note)
     except RemoteError as exc:
         raise RemoteSetupError(SetupState.UNUSABLE, str(exc)) from None
 
@@ -170,8 +172,9 @@ def remember_password(preferences: Preferences, store_path: Path, password: str)
 
 
 class Reached:
-    """The configuration opened for an activity's whole length — one unlock for all its
-    work — and what the engine said of each remote folder it was asked about. ``session``
+    """The configuration opened for a stretch of an activity's work — a preview's, a
+    verification's or a repair's whole length, a run's work on one remote destination — and
+    what the engine said of each remote folder it was asked about. ``session``
     is None when the configuration could not be opened, ``setup`` saying why; ``close``
     ends the engine."""
 

@@ -5,7 +5,9 @@ time so that names sort by time; the same record is copied into the destination'
 management folder when the run had verified (or, at a confirmed first run, written)
 that destination's marker, so a destination carries its own history. A record is
 written whatever the outcome, an unexpected failure included; a run whose process died
-is recorded as interrupted by the next run (``status.reap_interrupted``).
+is recorded as interrupted by the next run (``status.reap_interrupted``): the pair it was
+working on, or, when it had reached none, each destination it was to serve, a run waiting
+for its turn among them.
 
 Records feed the history, the estimate's throughput, and the per-destination state
 (first run confirmed, last success). Counts are kept in three fixed sets — planned,
@@ -96,6 +98,21 @@ SHARED_RECORD_LOST = "shared-record-lost"
 """Recorded last, beside the reasons a pair stopped or waits, when the pair is a shared
 destination whose record was lost: its run is a first run again, which leaves what is
 there and makes the record anew once the user has reviewed it (``run.runner``)."""
+
+PROCESS_ENDED = "process-ended"
+"""The reason an interrupted pair is recorded with: the run's process died working on it."""
+
+NEVER_BEGUN = "process-ended-before-it-began"
+"""The reason a destination is recorded interrupted with when the run's process died before it
+reached it, working on no destination: a run waiting for its turn — its first, or one between
+two of its destinations — above all. Nothing was written there."""
+
+LEFT_BY_USER = "paused-or-stopping"
+"""Recorded beside either of the two above when the user had paused the run or asked it to stop."""
+
+NEVER_REACHED = (NEVER_BEGUN, "cancelled-while-waiting", "cancelled")
+"""The reasons of a record of a destination the run never reached: it ended first, or a cancel
+came first. Nothing was written there, a marker included."""
 
 ESCALATE_AFTER = 2
 """Runs in a row a file must go unbacked-up before the user is told: skipped again by
@@ -360,6 +377,18 @@ def counts_for_streaks(record: RunRecord) -> bool:
                                                    and FIRST_RUN_REASON not in record.reasons)
 
 
+def reached(record: RunRecord) -> bool:
+    """Whether the run reached the destination the record is of."""
+    return not any(reason in NEVER_REACHED for reason in record.reasons)
+
+
+def cut_short(record: RunRecord) -> bool:
+    """Whether a run was cut off by its process ending — a shutdown, a crash — while the user
+    still wanted it: not one they had paused or were stopping."""
+    return (record.outcome is Outcome.INTERRUPTED and LEFT_BY_USER not in record.reasons
+            and (PROCESS_ENDED in record.reasons or NEVER_BEGUN in record.reasons))
+
+
 def last_counted(records: Sequence[RunRecord], marker_id: str) -> Optional[RunRecord]:
     """The pair's latest run that reached its copies; runs that did not (an absent drive,
     a stop, a cancel) neither extend a streak nor break it."""
@@ -457,7 +486,7 @@ def destination_state(records: Sequence[RunRecord], marker_id: str, marker: Opti
     if marker is not None:
         confirmed = marker is MarkerState.MATCH
     else:
-        confirmed = any(r.outcome in APPLIED and FIRST_RUN_REASON not in r.reasons for r in mine)
+        confirmed = any(r.outcome in APPLIED and FIRST_RUN_REASON not in r.reasons and reached(r) for r in mine)
     successes = [r.ended for r in mine if r.outcome is Outcome.COMPLETED]
     return DestinationState(first_run_confirmed=confirmed, last_success=max(successes) if successes else None,
                             last_full_verification=last_full_verification)

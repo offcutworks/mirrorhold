@@ -1,7 +1,8 @@
 """The scheduled tasks a configuration calls for, as Task Scheduler definitions.
 
 Per job with automatic runs switched on, at most two tasks, each named by the job's
-identifier and what starts it:
+identifier and what starts it (three kinds of task in all, a job with a schedule and no
+arrival having a logon task in place of an arrival's):
 
 - ``<job id>-arrival`` (the job runs when one of its drives is attached): an event
   trigger on a volume device being started or removed, and a logon trigger. Measured
@@ -19,6 +20,13 @@ identifier and what starts it:
   under way also has a one-off trigger for that day's runs still to come, which would
   otherwise wait for the next day: a calendar trigger's first run fixes the time of day it
   repeats at, so it cannot start partway through the day.
+- ``<job id>-logon`` (a job with a schedule that does not run when its drives are attached):
+  a logon trigger, so that a run a shutdown or a crash cut short continues at the next
+  logon rather than at the schedule's next occurrence (``automation.automatic.run_at_logon``);
+  a run that was started and died is no missed occurrence. A job that runs when its drives
+  are attached needs none: the logon trigger of its arrival's task runs it anyway. It is a
+  task of its own because a schedule's calendar triggers keep their catch-up only while that
+  task's definition stands, and one task cannot tell which of its triggers started it.
 
 Every task starts the installed copy's core — the source installation's copy, or the
 portable release set up — with its windowless interpreter, in its folder, against the
@@ -49,7 +57,7 @@ from ..jobs.model import Job
 from ..jobs.schedule import LAST, MONTHLY, Schedule, parse_schedule
 
 TASK_FOLDER = "\\MirrorHold"
-ARRIVAL, SCHEDULE = "arrival", "schedule"
+ARRIVAL, SCHEDULE, LOGON = "arrival", "schedule", "logon"
 DEFINITION_FORMAT = 2
 """Raised whenever the generated definition changes, so every task is re-registered once."""
 
@@ -96,7 +104,7 @@ class TaskSpec:
     name: str
     job_id: str
     job_name: str
-    kind: str                       # ARRIVAL or SCHEDULE
+    kind: str                       # ARRIVAL, SCHEDULE or LOGON
     schedule: Optional[str]         # the canonical schedule text of a SCHEDULE task
     launcher: Launcher
 
@@ -116,6 +124,8 @@ class TaskSpec:
         if self.kind == ARRIVAL:
             what = (f'MirrorHold runs the job "{self.job_name}" when one of its drives is attached, or the '
                     "computer starts with it attached.")
+        elif self.kind == LOGON:
+            what = f'MirrorHold continues the job "{self.job_name}" at logon when a shutdown or a crash cut its run short.'
         else:
             what = f'MirrorHold runs the job "{self.job_name}": {parse_schedule(self.schedule).describe()}.'
         return f"{what}\n{FINGERPRINT_PREFIX}{self.fingerprint}"
@@ -135,10 +145,10 @@ def fingerprint_of(description: str) -> Optional[str]:
 
 def desired_tasks(jobs: Iterable[Job], launcher: Launcher) -> Dict[str, TaskSpec]:
     """Every task the jobs call for: none for a job without automatic runs, or one whose
-    automatic runs are paused."""
+    every destination is switched off."""
     wanted: Dict[str, TaskSpec] = {}
     for job in jobs:
-        if not job.enabled:
+        if not job.switched_on:
             continue
         if job.triggers.on_arrival:
             name = task_name(job.job_id, ARRIVAL)
@@ -146,6 +156,9 @@ def desired_tasks(jobs: Iterable[Job], launcher: Launcher) -> Dict[str, TaskSpec
         if job.triggers.schedule is not None:
             name = task_name(job.job_id, SCHEDULE)
             wanted[name] = TaskSpec(name, job.job_id, job.name, SCHEDULE, job.triggers.schedule, launcher)
+            if not job.triggers.on_arrival:
+                name = task_name(job.job_id, LOGON)
+                wanted[name] = TaskSpec(name, job.job_id, job.name, LOGON, None, launcher)
     return wanted
 
 
@@ -158,14 +171,18 @@ def volume_event_query() -> str:
             f'<Select Path="{PNP_CHANNEL}">{escape(select)}</Select></Query></QueryList>')
 
 
+def _logon_trigger(user: str) -> str:
+    return (f"<LogonTrigger><Enabled>true</Enabled><UserId>{escape(user)}</UserId>"
+            f"<Delay>{LOGON_DELAY}</Delay></LogonTrigger>")
+
+
 def _triggers(spec: TaskSpec, now: datetime) -> str:
-    user = escape(spec.launcher.user)
+    if spec.kind == LOGON:
+        return _logon_trigger(spec.launcher.user)
     if spec.kind == ARRIVAL:
         return ("<EventTrigger><Enabled>true</Enabled>"
                 f"<Subscription>{escape(volume_event_query())}</Subscription>"
-                f"<Delay>{EVENT_DELAY}</Delay></EventTrigger>"
-                f"<LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId>"
-                f"<Delay>{LOGON_DELAY}</Delay></LogonTrigger>")
+                f"<Delay>{EVENT_DELAY}</Delay></EventTrigger>" + _logon_trigger(spec.launcher.user))
     schedule = parse_schedule(spec.schedule)
     by = _calendar(schedule)
     if schedule.every is None:

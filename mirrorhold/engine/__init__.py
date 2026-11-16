@@ -58,7 +58,9 @@ Design patterns
   version is refused until the pin moves and that suite has been re-run.
 - **One definition of no answer.** An engine that gives no whole answer — not reached, or an
   answer broken off — is one class of failure, shared by a copy's remote control and a
-  session, so every caller tells an engine not answering from a refusal the same way.
+  session, so every caller tells an engine not answering from a refusal the same way. A
+  session asks once more a request that leaves the remote as one asking would before it
+  raises one, and tells every such request to the note it was given (``remote``).
 - **Control by the process and the remote control.** A pause suspends the process. A copy's
   stops, graceful or immediate, are told through its remote control, its process ended only
   where the engine cannot be asked; the check of an encrypted remote is stopped by ending it.

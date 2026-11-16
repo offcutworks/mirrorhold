@@ -10,13 +10,14 @@ the two default exclusion categories, the user's own patterns, the holds (the co
 and percentage, and the share hold, which the user may switch off for a source of a few
 files, where one edit is already half), when the job runs by itself — when one of its
 drives is attached, on a schedule (daily, on chosen weekdays or on a day of the month; at
-times listed or every few hours, inside a window or not), and a switch that pauses both
-while keeping them (the job's enabled switch, shown the other way round) — and its versions
-and verification: keep every version, or
+times listed or every few hours, inside a window or not) — and its versions and
+verification: keep every version, or
 delete versions batches older than a number of days, and the interval of the reminder
 to verify every destination fully. A new job runs only when the user starts it and
 keeps every version. The snapshot choice is offered only for a drive that can be
-snapshotted; for another it is shown, disabled, and kept as stored.
+snapshotted; for another it is shown, disabled, and kept as stored. Each destination's
+switch is the job list's to set: the editor keeps it as stored, and a destination it adds
+is switched on.
 
 Deleting old versions is the only permanent deletion the tool performs, so a save that
 switches it on or lowers its days asks first (``cleanup_question``).
@@ -106,6 +107,7 @@ class Check:
 class DraftDestination:
     endpoint: AnyEndpoint
     marker_id: Optional[str] = None      # None: added in this editor; a new marker identity on save
+    switched_on: bool = True             # its switch as stored; the job list sets it, the editor keeps it
 
 
 @dataclass(frozen=True)
@@ -144,7 +146,6 @@ class JobDraft:
     window_on: bool = False                                    # every N hours only inside the window
     window_start_text: str = DEFAULT_WINDOW[0]
     window_end_text: str = DEFAULT_WINDOW[1]
-    paused: bool = False
     cleanup: bool = False                                      # delete versions batches older than keep_days_text
     keep_days_text: str = str(DEFAULT_KEEP_DAYS)
     reminder_days_text: str = str(DEFAULT_REMINDER_DAYS)
@@ -154,14 +155,14 @@ class JobDraft:
     def from_job(cls, job: Job, *, source_editable: bool) -> "JobDraft":
         draft = cls(name=job.name, source=job.source.endpoint, source_editable=source_editable,
                     read_from_snapshot=job.source.read_from_snapshot,
-                    destinations=[DraftDestination(d.endpoint, d.marker_id) for d in job.destinations],
+                    destinations=[DraftDestination(d.endpoint, d.marker_id, d.switched_on) for d in job.destinations],
                     sync_client_artefacts=job.source.default_exclusions.sync_client_artefacts,
                     transient_editor_files=job.source.default_exclusions.transient_editor_files,
                     patterns_text="\n".join(job.source.exclusions),
                     count_floor_text=str(job.holds.count_floor), percent_text=_percent_text(job.holds.percent),
                     share_on=job.holds.share is not None,
                     share_text=_percent_text(DEFAULT_SHARE if job.holds.share is None else job.holds.share),
-                    on_arrival=job.triggers.on_arrival, paused=not job.enabled,
+                    on_arrival=job.triggers.on_arrival,
                     cleanup=job.version_cleanup.enabled,
                     keep_days_text=str(job.version_cleanup.keep_days or DEFAULT_KEEP_DAYS),
                     reminder_days_text=str(job.verification_reminder_days), base=job)
@@ -186,7 +187,7 @@ class JobDraft:
 
     @property
     def automatic_chosen(self) -> bool:
-        """Whether the job would run by itself: the pause switch applies only then."""
+        """Whether the job would run by itself while a destination of it is switched on."""
         return self.on_arrival or self.scheduled
 
     # --- editing ---------------------------------------------------------------------
@@ -345,20 +346,21 @@ class JobDraft:
         if problems:
             return None, problems
         defaults = DefaultExclusions(self.sync_client_artefacts, self.transient_editor_files)
-        triggers, enabled = Triggers(self.on_arrival, schedule), not self.paused
+        triggers = Triggers(self.on_arrival, schedule)
         try:
             if self.base is None:
                 job = new_job(self.name, self.source, [d.endpoint for d in self.destinations],
                               read_from_snapshot=self.read_from_snapshot, default_exclusions=defaults,
-                              exclusions=self.patterns, holds=holds, triggers=triggers, enabled=enabled,
+                              exclusions=self.patterns, holds=holds, triggers=triggers,
                               version_cleanup=cleanup, verification_reminder_days=reminder)
                 return job, []
-            destinations = tuple(Destination(d.endpoint, d.marker_id) if d.marker_id else Destination(d.endpoint)
+            destinations = tuple(Destination(d.endpoint, d.marker_id, d.switched_on) if d.marker_id
+                                 else Destination(d.endpoint, switched_on=d.switched_on)
                                  for d in self.destinations)
             source = replace(self.base.source, endpoint=self.source, read_from_snapshot=self.read_from_snapshot,
                              default_exclusions=defaults, exclusions=self.patterns)
             return replace(self.base, name=self.name.strip(), source=source, destinations=destinations,
-                           holds=holds, triggers=triggers, enabled=enabled, version_cleanup=cleanup,
+                           holds=holds, triggers=triggers, version_cleanup=cleanup,
                            verification_reminder_days=reminder), []
         except ContractError as exc:
             return None, [Check(REFUSED, sentence(f"{exc}."), "input-contract")]

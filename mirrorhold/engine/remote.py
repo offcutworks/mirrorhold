@@ -22,6 +22,21 @@ for the session, the engine holding only a hash of them (``rclone.RemoteControl`
 whoever holds them reaches every remote of the configuration, and only this process does.
 The session's process sits in a job object, so it ends with the process that started it.
 
+A request the engine gives no whole answer to — none within ``CALL_TIMEOUT``, or one broken
+off — is asked once more where asking again leaves the remote as one asking would: a
+listing, a file's entry, the remote's features or space, a file's content, a folder made, a
+fingerprint job's state. Only a second request left unanswered raises ``RemoteUnanswered``.
+A request that changes the remote otherwise — a move, a write, a deletion — is never asked
+again, since the first may still be running in the engine; nor is the opening of the
+configuration, whose unlock a second request would only wait on again, nor the start of a
+fingerprint job, nor anything once the engine has ended. Seen on a OneDrive remote on the
+development machine: a request after an hour's copy went unanswered for two minutes, and the
+space asked right after it was answered. Every request left unanswered is told to the
+session's ``note`` (the diagnostic log): what was asked, how long it waited, what the engine
+said meanwhile, and how asking again went — so a log tells one request held up from a service
+that holds up every request. A pause or a cancel that waits on such a request waits on both
+askings, up to twice ``CALL_TIMEOUT``.
+
 Measured on the pinned engine against its own loopback S3, WebDAV and SFTP servers and its
 local and encrypted backends (``tests/test_engine_contract.py``):
 
@@ -67,7 +82,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Callable, Mapping, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from .rclone import (LOCAL_ENCODING, UNANSWERED, Configuration, Engine, EngineError, RemoteControl, RemoteRoot,
                      _Windows, engine_name, local_name, remote_path, start_controlled, without_queries)
@@ -80,6 +95,14 @@ START_PATIENCE = 30.0
 """Seconds a session's engine has to answer before its start is given up."""
 CALL_TIMEOUT = 120.0
 """Seconds one operation may take; a listing of a large folder takes the longest."""
+
+Note = Callable[[str], None]
+"""Told, in words, each request the engine gave no whole answer to and how asking again went."""
+
+_SAID_KEPT = 50
+"""The engine's latest lines a session keeps, each with when it came."""
+
+_T = TypeVar("_T")
 
 ListingProgress = Callable[[int], None]
 """Told the number of entries seen so far, after each folder; an exception it raises ends
@@ -226,6 +249,12 @@ class _Stream(io.RawIOBase):
                 super().close()
 
 
+def _request_words(method: str, body: Mapping) -> str:
+    """A request as the diagnostic log names it: its method and what it was asked about."""
+    about = [str(body[key]) for key in ("fs", "remote", "srcFs", "srcRemote", "dstFs", "dstRemote") if body.get(key)]
+    return without_queries(f"{method} ({', '.join(about)})" if about else method)
+
+
 def _configuration_reason(reason: str) -> str:
     """Why the engine could not open a configuration, as it says it, without the wrapping of
     the failure it raises and without its advice to set ``RCLONE_CONFIG_PASS``: this tool
@@ -241,13 +270,17 @@ class RemoteSession:
     Every path is a carried relative path (backslash-separated) below the ``RemoteRoot``
     it is given with; '' is that folder itself. Each operation raises ``RemoteError`` with
     the engine's reason when it fails; a path that is not there is an answer (None or
-    False) where the operation says so."""
+    False) where the operation says so. ``note``: where each request left unanswered is
+    told (the module's docstring); nowhere when not given."""
 
-    def __init__(self, engine: Engine, configuration: Configuration, *, patience: float = START_PATIENCE):
+    def __init__(self, engine: Engine, configuration: Configuration, *, patience: float = START_PATIENCE,
+                 note: Optional[Note] = None):
         self.engine = engine
         self.configuration = configuration
+        self._note: Note = note or (lambda text: None)
         self._control = RemoteControl()
-        self._said: deque = deque(maxlen=20)
+        self._said: deque = deque(maxlen=_SAID_KEPT)     # (monotonic time, line)
+        self._said_lock = threading.Lock()
         self._job = None
         try:
             self._process, self._job = start_controlled(
@@ -267,14 +300,25 @@ class RemoteSession:
         for line in self._process.stderr:
             line = line.strip()
             if line:
-                self._said.append(without_queries(line))
+                with self._said_lock:
+                    self._said.append((time.monotonic(), without_queries(line)))
+
+    def _said_since(self, moment: float) -> Tuple[str, ...]:
+        """The engine's lines that came at ``moment`` or later, of those kept."""
+        with self._said_lock:
+            return tuple(line for at, line in self._said if at >= moment)
+
+    def _last_said(self) -> str:
+        """The engine's latest line; '' when it said none."""
+        with self._said_lock:
+            return self._said[-1][1] if self._said else ""
 
     def _wait_up(self, patience: float) -> None:
         deadline = time.monotonic() + patience
         while time.monotonic() < deadline:
             if self._process.poll() is not None:
                 self._reader.join(timeout=5)
-                said = re.sub(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d\s+", "", self._said[-1]) if self._said else ""
+                said = re.sub(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d\s+", "", self._last_said())
                 self.close()
                 raise RemoteError(f"the sync engine ended as it started: {said or 'no message'}")
             try:
@@ -330,7 +374,47 @@ class RemoteSession:
 
     # --- calls -------------------------------------------------------------------
 
-    def _call(self, method: str, body: dict, timeout: float = CALL_TIMEOUT) -> dict:
+    def _asked(self, what: str, attempt: Callable[[], _T], *, repeatable: bool) -> _T:
+        """``attempt``'s answer, ``what`` naming the request for the diagnostic log. One the
+        engine gives no whole answer to (``RemoteUnanswered``) is told to ``note`` and, where
+        ``repeatable`` — asking again leaves the remote as one asking would — asked once more,
+        unless the engine has ended; a second left unanswered, or a first not asked again, is
+        raised, and a second the engine refuses raises its ``RemoteError`` as a first would."""
+        started = time.monotonic()
+        try:
+            return attempt()
+        except RemoteUnanswered as exc:
+            first = exc
+        heard = " | ".join(self._said_since(started)) or "nothing"
+        head = f"remote session: {what} got no whole answer after {time.monotonic() - started:.1f} s ({first})"
+        if self._process.poll() is not None:
+            self._note(f"{head}; the engine has ended, so it is not asked again; the engine said meanwhile: {heard}")
+            raise first
+        if not repeatable:
+            self._note(f"{head}; it is not asked again; the engine said meanwhile: {heard}")
+            raise first
+        self._note(f"{head}; it is asked once more; the engine said meanwhile: {heard}")
+        again = time.monotonic()
+        try:
+            found = attempt()
+        except RemoteUnanswered as second:
+            heard = " | ".join(self._said_since(again)) or "nothing"
+            self._note(f"remote session: {what} got no whole answer when asked again either, after "
+                       f"{time.monotonic() - again:.1f} s ({second}); the engine said meanwhile: {heard}")
+            raise
+        except RemoteError as refusal:
+            self._note(f"remote session: {what} was answered when asked again, after "
+                       f"{time.monotonic() - again:.1f} s, with a refusal: {refusal}")
+            raise
+        self._note(f"remote session: {what} was answered when asked again, after {time.monotonic() - again:.1f} s")
+        return found
+
+    def _call(self, method: str, body: dict, timeout: float = CALL_TIMEOUT, *, repeatable: bool = False) -> dict:
+        """The method's answer; ``repeatable``: as ``_asked``."""
+        return self._asked(_request_words(method, body), lambda: self._call_once(method, body, timeout),
+                           repeatable=repeatable)
+
+    def _call_once(self, method: str, body: dict, timeout: float) -> dict:
         try:
             return self._control.call(method, body, timeout)
         except urllib.error.HTTPError as exc:
@@ -351,7 +435,7 @@ class RemoteSession:
     # --- what a remote is --------------------------------------------------------
 
     def features(self, root: RemoteRoot) -> RemoteFeatures:
-        info = self._call("operations/fsinfo", {"fs": root.fs})
+        info = self._call("operations/fsinfo", {"fs": root.fs}, repeatable=True)
         found = info.get("Features") or {}
         return RemoteFeatures(
             moves=bool(found.get("Move")), copies=bool(found.get("Copy")),
@@ -364,7 +448,8 @@ class RemoteSession:
 
     def _encrypts(self, root: RemoteRoot) -> bool:
         try:
-            self._call("backend/command", {"command": "encode", "fs": root.fs, "arg": ["mirrorhold"]})
+            self._call("backend/command", {"command": "encode", "fs": root.fs, "arg": ["mirrorhold"]},
+                       repeatable=True)
         except RemoteError as exc:
             reason = str(exc)
             if "command not found" in reason or "doesn't support backend commands" in reason:
@@ -375,7 +460,7 @@ class RemoteSession:
     def space(self, root: RemoteRoot) -> Optional[Space]:
         """The space the service reports for the folder, or None when it reports none."""
         try:
-            about = self._call("operations/about", {"fs": root.fs})
+            about = self._call("operations/about", {"fs": root.fs}, repeatable=True)
         except RemoteError as exc:
             if "doesn't support about" in str(exc):
                 return None
@@ -395,7 +480,7 @@ class RemoteSession:
             opt.update(showHash=True, hashTypes=list(kinds))
         try:
             item = self._call("operations/stat", {"fs": root.fs, "remote": remote_path(relative),
-                                                  "opt": opt}).get("item")
+                                                  "opt": opt}, repeatable=True).get("item")
         except RemoteError as exc:
             if _missing(str(exc)):
                 return None
@@ -414,7 +499,7 @@ class RemoteSession:
         if kinds:
             opt["hashTypes"] = list(kinds)
         try:
-            listed = self._call("operations/list", {"fs": root.fs, "remote": below, "opt": opt})
+            listed = self._call("operations/list", {"fs": root.fs, "remote": below, "opt": opt}, repeatable=True)
         except RemoteError as exc:
             if _missing(str(exc)):
                 return None
@@ -452,24 +537,32 @@ class RemoteSession:
         """The file's content, its first ``limit`` bytes when given; None when it is not there."""
         if limit is not None and limit <= 0:
             return b""
-        response = self._served(root, relative, {"Range": f"bytes=0-{limit - 1}"} if limit is not None else {})
-        if response is None:
+        headers = {"Range": f"bytes=0-{limit - 1}"} if limit is not None else {}
+
+        def whole() -> Optional[bytes]:
+            response = self._served_once(root, relative, headers)
+            if response is None:
+                return None
+            try:
+                with response:
+                    return response.read()
+            except UNANSWERED as exc:
+                raise RemoteUnanswered(f"{relative}: the sync engine did not answer: {exc}") from None
+
+        data = self._asked(_request_words("read", {"fs": root.joined(relative).fs}), whole, repeatable=True)
+        if data is None:
             return None
-        try:
-            with response:
-                data = response.read()
-        except UNANSWERED as exc:
-            raise RemoteUnanswered(f"{relative}: the sync engine did not answer: {exc}") from None
         return data if limit is None else data[:limit]
 
     def open_file(self, root: RemoteRoot, relative: str) -> Optional[BinaryIO]:
         """The file's content as a stream read from its start, for a file too large to hold
-        whole; None when it is not there. A read of the stream that the engine breaks off
-        raises ``RemoteError``; the caller closes it."""
-        response = self._served(root, relative, {})
+        whole; None when it is not there. Opening it is asked once more when unanswered; a read
+        of the stream that the engine breaks off raises ``RemoteError``; the caller closes it."""
+        response = self._asked(_request_words("read", {"fs": root.joined(relative).fs}),
+                               lambda: self._served_once(root, relative, {}), repeatable=True)
         return _Stream(response, relative) if response is not None else None
 
-    def _served(self, root: RemoteRoot, relative: str, headers: Mapping[str, str]):
+    def _served_once(self, root: RemoteRoot, relative: str, headers: Mapping[str, str]):
         """The engine's response serving the file (``--rc-serve``), open; None when it is not there."""
         target = urllib.parse.quote(f"[{root.fs}]", safe="[]:/") + "/" + urllib.parse.quote(
             remote_path(relative), safe="/")
@@ -496,7 +589,7 @@ class RemoteSession:
                                                         "hashType": kind, "_async": True})
         job = started.get("jobid")
         while True:
-            status = self._call("job/status", {"jobid": job})
+            status = self._call("job/status", {"jobid": job}, repeatable=True)
             if status.get("finished"):
                 found = str((status.get("output") or {}).get("hash") or "")
                 if not status.get("success") or not found:
@@ -521,15 +614,19 @@ class RemoteSession:
                 "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8") + bytes(data) \
             + f"\r\n--{boundary}--\r\n".encode("ascii")
         query = urllib.parse.urlencode({"fs": root.fs, "remote": folder})
-        try:
-            with self._control.request(f"operations/uploadfile?{query}", data=body, timeout=CALL_TIMEOUT,
-                                       headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}) \
-                    as response:
-                response.read()
-        except urllib.error.HTTPError as exc:
-            raise RemoteError(f"{relative}: {self._refusal(exc)}") from None
-        except UNANSWERED as exc:
-            raise RemoteUnanswered(f"{relative}: the sync engine did not answer: {exc}") from None
+
+        def upload() -> None:
+            try:
+                with self._control.request(f"operations/uploadfile?{query}", data=body, timeout=CALL_TIMEOUT,
+                                           headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}) \
+                        as response:
+                    response.read()
+            except urllib.error.HTTPError as exc:
+                raise RemoteError(f"{relative}: {self._refusal(exc)}") from None
+            except UNANSWERED as exc:
+                raise RemoteUnanswered(f"{relative}: the sync engine did not answer: {exc}") from None
+
+        self._asked(_request_words("write", {"fs": root.joined(relative).fs}), upload, repeatable=False)
 
     def move_file(self, root: RemoteRoot, old: str, new: str) -> None:
         """Move a file within the remote. A file already at ``new`` is replaced: the caller
@@ -553,7 +650,7 @@ class RemoteSession:
     def make_folder(self, root: RemoteRoot, relative: str = "") -> None:
         """Make the folder and those it lies in; a service with no folders of its own makes
         none, and the folder exists once a file lies in it."""
-        self._call("operations/mkdir", {"fs": root.fs, "remote": remote_path(relative)})
+        self._call("operations/mkdir", {"fs": root.fs, "remote": remote_path(relative)}, repeatable=True)
 
     def remove_empty_folders(self, root: RemoteRoot, relative: str) -> None:
         """Remove the folder at ``relative`` and every folder in it that holds nothing,

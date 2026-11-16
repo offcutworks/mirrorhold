@@ -212,7 +212,7 @@ class _Repairer:
                                  destination=f"destination {index}", pair_started=utc_now(), selected=[index],
                                  kind=KIND_REPAIR)
         self.board = StatusBoard(self.layout, self.status)
-        self.control = RunControl(self.status)
+        self.control = RunControl(self.status, self.board)
         self.hold = Hold(repair_reason(job.name), lambda: self.status.admitted and not self.status.paused,
                          lambda: _load(store).preferences.activities, system=power)
         self.pump = StatusPump(self.board, self.control, on_tick=self.hold.tick)

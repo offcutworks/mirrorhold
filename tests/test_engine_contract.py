@@ -40,13 +40,14 @@ import urllib.request
 import uuid
 from ctypes import wintypes
 from pathlib import Path
+from unittest import mock
 
 from support import TempDirTest, remove_temporary_folder, temporary_folder
 
 from mirrorhold.engine.rclone import (GRACEFUL_END_EXIT, PINNED_VERSION, Configuration, RemoteRoot, StopKind,
                                        Transfer, open_engine, pinned_engine_path, run_engine, source_file_unreadable,
                                        start_engine, uncarried)
-from mirrorhold.engine.remote import RemoteError, RemoteSession
+from mirrorhold.engine.remote import RemoteError, RemoteSession, RemoteUnanswered
 
 ENGINE = pinned_engine_path()
 INSTALLED = ENGINE.is_file()
@@ -1487,6 +1488,107 @@ class RemoteFilesTest(RemoteTest):
                 self.assertFalse(self.session.delete_folder(root, ".mirrorhold\\versions\\B1"))
                 found = {e.path for e in self.session.list_tree(root) if not e.is_dir}
                 self.assertEqual(found, {"keep.txt", ".mirrorhold\\versions\\B2\\new.txt"})
+
+
+class UnansweredRequestTest(RemoteTest):
+    """A request the session's engine gives no whole answer to: one that leaves the remote as
+    one asking would is asked once more, one that changes it is not, and each is told to the
+    session's note. The engine's silence is invented by failing the remote control's first
+    calls as a timed-out connection does; the requests that are let through reach the engine."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.loopback.root_of("local", self.case)
+        self.session.make_folder(self.root)
+        self.session.write(self.root, "a.txt", b"abc")
+        self.notes = []
+
+    def silent(self, method: str, times: int):
+        """The remote control with ``method``'s first ``times`` calls timing out."""
+        call, left = self.session._control.call, [times]
+
+        def answer(name, body=None, timeout=5.0):
+            if name == method and left[0] > 0:
+                left[0] -= 1
+                raise TimeoutError("timed out")
+            return call(name, body, timeout)
+
+        return mock.patch.object(self.session._control, "call", side_effect=answer)
+
+    def noted(self):
+        return mock.patch.object(self.session, "_note", self.notes.append)
+
+    def test_an_entry_unanswered_once_is_answered_when_asked_again(self):
+        with self.silent("operations/stat", 1) as call, self.noted():
+            found = self.session.stat(self.root, "a.txt")
+        self.assertEqual(found.size, 3)
+        self.assertEqual([c.args[0] for c in call.call_args_list].count("operations/stat"), 2)
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertIn(f"operations/stat ({self.root.fs}, a.txt) got no whole answer after", self.notes[0])
+        self.assertIn("(the sync engine did not answer: timed out); it is asked once more", self.notes[0])
+        self.assertIn(f"operations/stat ({self.root.fs}, a.txt) was answered when asked again", self.notes[1])
+
+    def test_an_entry_unanswered_twice_is_the_remote_not_answering(self):
+        with self.silent("operations/stat", 2), self.noted():
+            with self.assertRaises(RemoteUnanswered) as raised:
+                self.session.stat(self.root, "a.txt")
+        self.assertEqual(str(raised.exception), "the sync engine did not answer: timed out")
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertIn("got no whole answer when asked again either", self.notes[1])
+
+    def test_a_refusal_when_asked_again_is_noted_and_answers_as_a_first_would(self):
+        with self.silent("operations/list", 1), self.noted():
+            self.assertIsNone(self.session.list_folder(self.root, "nowhere"))
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertIn("was answered when asked again", self.notes[1])
+        self.assertIn("with a refusal:", self.notes[1])
+
+    def test_an_engine_that_has_ended_is_not_asked_again(self):
+        notes = []
+        session = RemoteSession(open_engine(), self.loopback.configuration, note=notes.append)
+        try:
+            session._process.kill()
+            session._process.wait(30)
+            with self.assertRaises(RemoteUnanswered):
+                session.stat(self.root, "a.txt")
+        finally:
+            session.close()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("the engine has ended, so it is not asked again", notes[0])
+
+    def test_a_listing_and_a_folder_made_are_asked_again(self):
+        with self.silent("operations/list", 1), self.noted():
+            self.assertEqual([e.path for e in self.session.list_folder(self.root)], ["a.txt"])
+        with self.silent("operations/mkdir", 1), self.noted():
+            self.session.make_folder(self.root, "made")
+        self.assertTrue(self.session.stat(self.root, "made").is_dir)
+        self.assertEqual(sum("was answered when asked again" in n for n in self.notes), 2, self.notes)
+
+    def test_a_move_unanswered_is_not_asked_again(self):
+        with self.silent("operations/movefile", 1) as call, self.noted():
+            with self.assertRaises(RemoteUnanswered):
+                self.session.move_file(self.root, "a.txt", "b.txt")
+        self.assertEqual([c.args[0] for c in call.call_args_list].count("operations/movefile"), 1)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        self.assertIn(f"operations/movefile ({self.root.fs}, a.txt, {self.root.fs}, b.txt) got no whole answer",
+                      self.notes[0])
+        self.assertIn("it is not asked again", self.notes[0])
+        self.assertIsNotNone(self.session.stat(self.root, "a.txt"))
+
+    def test_a_files_content_unanswered_once_is_served_when_asked_again(self):
+        request, left = self.session._control.request, [1]
+
+        def serve(path, **options):
+            if path.startswith("[") and left[0] > 0:            # the served file, not a method
+                left[0] -= 1
+                raise TimeoutError("timed out")
+            return request(path, **options)
+
+        with mock.patch.object(self.session._control, "request", side_effect=serve), self.noted():
+            self.assertEqual(self.session.read(self.root, "a.txt"), b"abc")
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertIn(f"read ({self.root.joined('a.txt').fs}) got no whole answer", self.notes[0])
+        self.assertIn("was answered when asked again", self.notes[1])
 
 
 class RemoteTransferTest(RemoteTest):

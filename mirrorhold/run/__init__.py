@@ -17,11 +17,13 @@ Structure
                      changed file opened before the copy, the engine's copy of an
                      explicit list (files it finds identical only dated, files it
                      passes over recorded as skipped), folders.
-    control.py       RunControl (pause, resume, cancel as the run sees them) and
+    control.py       RunControl (pause, resume, cancel as the run sees them, a paused one
+                     taking its drives back before it works again) and
                      StatusPump (the thread that publishes status and reads requests,
                      counting files found identical as done); time_left().
-    runner.py        run_job() and preview_job(): a job's pairs in order, once the run
-                     is admitted (records.admission), the source read from a volume
+    runner.py        run_job() and preview_job(): a job's pairs, each at a turn of its
+                     own (records.admission), the first by number nothing holds back
+                     first, the source listed once at the first and read from a volume
                      snapshot when one can be made, a verified destination's expired
                      versions batches deleted when the job's cleanup is on, the gate's
                      space check made on the drive measured then and under the
@@ -53,12 +55,15 @@ through the status channel (``records.status``); the run reaches the engine only
 through its adapter. A destination is reached only through its storage (``storage``):
 its marker and shared record, its listing, every change applied, the job's definition and
 the record's copy kept there, and the engine is handed the destination and the batch where
-the storage locates them. A remote destination's storage comes from one engine session the
-run opens once admitted, and a preview once it starts (``remotes.reach``), kept to its end
-so an encrypted configuration is unlocked once. A run waits for its turn before anything else
-(``records.admission``) and then works beside every run and verification it does not
-conflict with; its gate counts as used what those runs still have to write on its
-destination's drive, and publishes what it lets this pair copy there in turn.
+the storage locates them. A remote destination's storage comes from an engine session the
+run opens for that destination once admitted there and closes when it is done there, and
+a preview from one it opens as it starts and keeps to its end (``remotes.reach``). A run
+waits for its turn before anything else (``records.admission``) and then works beside
+every run and verification it does not conflict with, holding the drives of its source and
+of the one destination it works on; done there, it gives everything up and asks again for
+the destinations it has left, working next on the first of them nothing holds back. Its
+gate counts as used what other runs still have to write on its destination's drive, and
+publishes what it lets this pair copy there in turn.
 
 Design patterns
 ---------------
@@ -84,7 +89,10 @@ Design patterns
 Caveats
 -------
 - A pause lasts within the session: a shutdown while paused is an interruption, and
-  the pair's next run converges (the versions batch of the interrupted run stays).
+  the pair's next run converges (the versions batch of the interrupted run stays). While it
+  lasts the run's drives are free for others (``records.admission``), and what they write
+  there meets the plan the run holds only as any other change on those drives would; the
+  space its gate let it use stays counted, its folders stay its own.
 - An engine that makes no progress at all for ``apply.STALL_LIMIT`` (30 minutes) while
   not paused — no byte copied, no file checked, nothing found identical or failed,
   nothing read or written by its process, or its remote control not answering — is
@@ -121,7 +129,9 @@ Caveats
   SFTP as the engine serves them, an encrypted remote — such a file is copied again, its
   previous copy moving into the batch (measured on the engine's loopback backends).
 - A remote is recorded absent while its service cannot be reached, and waits like a drive
-  not attached; one that stops answering fails the pair (``remote-failed``) — said as before
+  not attached; one that stops answering — a request left unanswered, a second time where
+  asking again leaves the remote as it was (``engine.remote``) — fails the pair
+  (``remote-failed``) — said as before
   any of the plan was applied where its marker or a shared destination's record was read,
   its changed files' leading bytes read or its space asked, and with what
   was done recorded, the next run converging, once the run wrote there. No other

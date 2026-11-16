@@ -27,6 +27,7 @@ from mirrorhold.jobs.store import SCHEMA_VERSION, ConfigStore, StoreContents
 from mirrorhold.locations import RuntimeLayout, runtime_layout
 from mirrorhold.notifications.toast import NotificationError
 from mirrorhold.records import diagnostics
+from mirrorhold.records.admission import WaitedFor
 from mirrorhold.records.record import read_records
 from mirrorhold.records.status import LiveStatus, Phase, StatusBoard, Wanted
 
@@ -442,6 +443,37 @@ class InProcessTest(TempDirTest):
         self.assertEqual((code, err), (EXIT_REFUSED, "refused: the request could not be written: another program kept "
                                                      "the run's control file open; try again\n"))
         self.assertEqual(board.wanted(), Wanted(True, None))
+
+    def activity(self, letter, *, phase=Phase.WAITING, **fields):
+        board = StatusBoard(runtime_layout(self.store_path), LiveStatus(letter * 32, os.getpid(), "j" * 32, "Photos",
+                                                                         "manual", "2026-10-14T10:00:00Z", phase=phase,
+                                                                         **fields))
+        board.open()
+        self.addCleanup(board.close)
+        return board
+
+    def test_next_moves_a_waiting_run_to_the_front_of_the_line(self):
+        first = self.activity("a", queued="2026-10-14T10:00:00.000005Z")
+        second = self.activity("b", queued="2026-10-14T10:00:00.000009Z")
+        code, out, _ = self.cli("next", "bbbb")
+        self.assertEqual((code, out), (EXIT_OK, f"run {'b' * 12} ('Photos'): moved to the front of the line\n"))
+        self.assertLess(second.wanted().queued, first.status.queued)
+
+    def test_next_refuses_what_does_not_wait_and_a_verification(self):
+        self.activity("a", phase=Phase.COPYING)
+        code, _, err = self.cli("next", "aaaa")
+        self.assertEqual((code, err), (EXIT_REFUSED, f"refused: run {'a' * 12} does not wait for its turn\n"))
+        self.activity("b", kind="verification")
+        code, _, err = self.cli("next", "bbbb")
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertIn("a verification waits behind every run and repair", err)
+
+    def test_status_says_what_one_taking_its_drives_back_waits_for(self):
+        self.activity("a", phase=Phase.COPYING, paused=True, resuming=True,
+                      waiting_for=WaitedFor("b" * 32, "run", "Work", drive="drive I:").to_document())
+        out = self.cli("status")[1]
+        self.assertIn(f"[resuming, waiting for the run of 'Work' ({'b' * 12}) to finish; both use drive I:]", out)
+        self.assertNotIn("[paused]", out)
 
     def test_a_job_file_another_program_holds_is_reported_in_words(self):
         self.assertEqual(self.add("Work", self.vol_d / "Work", self.vol_e / "Work")[0], EXIT_OK)

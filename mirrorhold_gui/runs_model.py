@@ -28,6 +28,12 @@ published, each until its next attempt — waits for its turn. A status that nam
 and says nothing of its turn — one published by an older copy of the tool — waits for
 the run in progress, as that copy's runs did.
 
+A paused activity uses no drive, so what waits only for its drives starts meanwhile; asked
+to work again it says whom it waits for until it has them back, and can be paused again. A
+waiting run or repair behind others it conflicts with offers ``RUN_NEXT``, which moves it to
+the front of the line (``records.status.run_next``); a verification goes behind every run and
+repair wherever it stands, so it offers none.
+
 A live activity whose status cannot be read now has a row too, titled as the window last
 read it (by its identifier where it read nothing): it holds its turn, so whatever asks
 for its turn waits for it, and neither its progress nor a request can be shown or made
@@ -47,7 +53,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from mirrorhold.jobs.model import Job
 from mirrorhold.maintenance.verification import VerificationMode
-from mirrorhold.records.admission import WaitedFor, line_words, starting
+from mirrorhold.records.admission import Activity, WaitedFor, line_words, starting
 from mirrorhold.records.status import ANY_KIND, ANY_KINDS, KIND_REPAIR, KIND_VERIFICATION, UNREADABLE, CancelMode, \
     ObservedRun, Phase, is_repair, is_run, is_verification, line_order, place_of
 from mirrorhold.wording import agreeing, counted
@@ -60,6 +66,9 @@ STARTING = "starting"
 
 TURN = "waiting for its turn"
 """A row's phase while its activity has asked for its turn and names nothing it waits for."""
+
+RUN_NEXT = "Run next"
+"""What a waiting row's button, and the icon's entry for it, say."""
 
 _BEFORE_PLAN = (Phase.SNAPSHOT.value, Phase.CLEANING.value, Phase.LISTING.value, Phase.PLANNING.value)
 """A run's steps before it has a plan: its counts would read 0 of 0."""
@@ -84,6 +93,8 @@ class RunPanel:
     note: str = ""                     # a verification's estimate; files found identical; why a waiting one waits
     repair: bool = False
     readable: bool = True              # False: its status cannot be read now, so no progress is shown
+    resuming: bool = False             # asked to work again, waiting for its drives
+    can_run_next: bool = False         # the "Run next" button of a waiting run or repair with others before it
 
 
 def pause_words(panel: RunPanel) -> str:
@@ -146,6 +157,36 @@ def waits(status: dict) -> bool:
     return status.get("phase") == Phase.WAITING.value and not starting(status)
 
 
+def resuming_words(status: dict) -> str:
+    """"resuming, waiting for 'Photos'": a row's phase while its activity takes its drives back."""
+    other = waited_for_words(status)
+    return f"resuming, waiting for {other}" if other else "resuming"
+
+
+def can_move_up(status: dict) -> bool:
+    """Whether a waiting run or repair has others before it to pass."""
+    return status.get("phase") == Phase.WAITING.value and place_of(status) > 1
+
+
+def waiting_behind(statuses: Iterable[dict], status: dict) -> Tuple[str, ...]:
+    """The runs of ``status``'s job that wait for their turn behind it: what would start as soon
+    as it ended, so what a cancel of it asks about. One that waits for its first turn has
+    nothing behind it that its end would start; one waiting between two of its destinations
+    has begun, and every other run of its job waits behind it (``admission.goes_first``)."""
+    if status.get("phase") == Phase.WAITING.value and not Activity.from_status(status).begun:
+        return ()
+    return tuple(st["run_id"] for st in statuses
+                 if is_run(st) and st.get("job_id") == status.get("job_id") and st.get("run_id") != status.get("run_id")
+                 and st.get("phase") == Phase.WAITING.value)
+
+
+def also_cancel_words(count_behind: int) -> str:
+    """What the cancel dialog's choice about the runs ``waiting_behind`` says."""
+    if count_behind == 1:
+        return "Also cancel the run of this job waiting behind it"
+    return f"Also cancel the {count_behind} runs of this job waiting behind it"
+
+
 def _waiting_phase(status: dict) -> str:
     """A waiting row's phase: whom it waits for; starting; its turn, for one of this copy that
     has asked and names nothing; or, for an older copy's status naming nothing, the run in
@@ -177,11 +218,24 @@ def _phase_words(status: dict) -> str:
     if phase == Phase.CHECKING.value:
         words = "checking changed files can be read"
         return words + (f"   {count(int(status.get('examined') or 0))} of {count(total)}" if total else "")
+    moving_back = _moving_back(status)
+    if moving_back:
+        return moving_back
     return {Phase.SNAPSHOT.value: "taking a snapshot of the source", Phase.PLANNING.value: "planning",
             Phase.CLEANING.value: "removing old versions",
             Phase.RENAMING.value: "renaming", Phase.MOVING.value: "moving into versions",
             Phase.COPYING.value: "copying", Phase.FINISHING.value: "finishing",
             Phase.RELEASING.value: "removing the snapshot"}.get(phase, str(phase or ""))
+
+
+def _moving_back(status: dict) -> str:
+    """'moving earlier copies back out of versions   3 of 40' — the previous copies of changed
+    files the engine set aside and did not replace before it ended; '' outside that step."""
+    total = int(status.get("to_examine") or 0)
+    if status.get("phase") != Phase.FINISHING.value or not total:
+        return ""
+    return (f"moving earlier copies back out of versions   {count(int(status.get('examined') or 0))} of "
+            f"{count(total)}")
 
 
 def in_flight_left(status: dict) -> str:
@@ -287,13 +341,16 @@ def verification_panel(observed: ObservedRun, places: Places = NO_PLACES) -> Run
     verify = st.get("verify") or {}
     phase = st.get("phase")
     waiting = phase == Phase.WAITING.value
-    paused = bool(st.get("paused"))
+    resuming = bool(st.get("resuming"))
+    paused = bool(st.get("paused")) and not resuming
     if waiting:
         other = waited_for_words(st)
         if verify.get("gave_way"):
             words = f"gave way, waiting for {other}" if other else "waiting: a backup runs first"
         else:
             words = _waiting_phase(st)
+    elif resuming:
+        words = resuming_words(st)
     elif paused:
         words = "paused"
     elif phase == Phase.LISTING.value:
@@ -308,7 +365,7 @@ def verification_panel(observed: ObservedRun, places: Places = NO_PLACES) -> Run
     if verifying or (paused and verify.get("files")):
         parts = [f"{count(int(verify.get('files_done') or 0))} of {files(int(verify.get('files') or 0))}",
                  f"{size(done)} of {size(total)}"]
-        if verifying and not paused and st.get("rate"):
+        if verifying and not paused and not resuming and st.get("rate"):
             parts.append(rate(float(st["rate"])))
             if st.get("eta_seconds") is not None:
                 parts.append(f"about {duration(float(st['eta_seconds']))} left")
@@ -323,14 +380,16 @@ def verification_panel(observed: ObservedRun, places: Places = NO_PLACES) -> Run
     return RunPanel(observed.run_id, _title(st, places), words, fraction, counts, flight, waiting, paused, None,
                     can_pause=live and not waiting and not paused, can_resume=live and paused,
                     can_cancel=live, can_stop_now=False, verification=True,
-                    note=waiting_note(st) if waiting else estimate_words(verify.get("estimate")))
+                    note=waiting_note(st) if waiting or resuming else estimate_words(verify.get("estimate")),
+                    resuming=resuming)
 
 
 def repair_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
     st = observed.status
     phase = st.get("phase")
     waiting = phase == Phase.WAITING.value
-    paused = bool(st.get("paused"))
+    resuming = bool(st.get("resuming"))
+    paused = bool(st.get("paused")) and not resuming
     cancelling = CancelMode(st["cancelling"]) if st.get("cancelling") else None
     planned, done = st.get("planned") or {}, st.get("done") or {}
     total, copied = int(planned.get("files_to_copy", 0)), int(done.get("files_copied", 0))
@@ -338,6 +397,8 @@ def repair_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
         words = _waiting_phase(st)
     elif cancelling is not None:
         words = "stopping after the files in flight"
+    elif resuming:
+        words = resuming_words(st)
     elif paused:
         words = "paused"
     else:
@@ -350,7 +411,8 @@ def repair_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
     return RunPanel(observed.run_id, _title(st, places), words, fraction, counts, "", waiting, paused, cancelling,
                     can_pause=live and not waiting and not paused and cancelling is None,
                     can_resume=live and paused and cancelling is None, can_cancel=live and cancelling is None,
-                    can_stop_now=False, note=waiting_note(st) if waiting else "", repair=True)
+                    can_stop_now=False, note=waiting_note(st) if waiting or resuming else "", repair=True,
+                    resuming=resuming, can_run_next=live and can_move_up(st))
 
 
 def run_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
@@ -363,7 +425,8 @@ def run_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
         return repair_panel(observed, places)
     title = _title(st, places)
     waiting = st.get("phase") == Phase.WAITING.value
-    paused = bool(st.get("paused"))
+    resuming = bool(st.get("resuming"))
+    paused = bool(st.get("paused")) and not resuming
     cancelling = CancelMode(st["cancelling"]) if st.get("cancelling") else None
     planned, done = st.get("planned") or {}, st.get("done") or {}
     identical = int(done.get("files_identical", 0))
@@ -373,10 +436,13 @@ def run_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
     copying = st.get("phase") == Phase.COPYING.value
     fraction = min(1.0, copied / total_bytes) if copying and total_bytes else None
 
+    moving_back = _moving_back(st)
     if cancelling is CancelMode.GRACEFUL:
-        phase = "cancelling: finishing the files in flight"
+        phase = f"cancelling: {moving_back}" if moving_back else "cancelling: finishing the files in flight"
     elif cancelling is CancelMode.IMMEDIATE:
-        phase = "stopping now"
+        phase = f"stopping now: {moving_back}" if moving_back else "stopping now"
+    elif resuming:
+        phase = resuming_words(st)
     elif paused:
         phase = "paused"
     else:
@@ -389,7 +455,7 @@ def run_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
         parts = [] if st.get("phase") in _BEFORE_PLAN else [
             f"{count(files_done)} of {files(int(planned.get('files_to_copy', 0)))}",
             f"{size(copied)} of {size(total_bytes)}"]
-        if copying and not paused and st.get("rate"):
+        if copying and not paused and not resuming and st.get("rate"):
             parts.append(rate(float(st["rate"])))
             if st.get("eta_seconds") is not None:
                 parts.append(f"about {duration(float(st['eta_seconds']))} left")
@@ -407,7 +473,7 @@ def run_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
                           for name, total, got in flying[:3])
         more = f" and {len(flying) - 3} more" if len(flying) > 3 else ""
         in_flight = f"In flight: {shown}{more}"
-    elif comparing and copying and not paused:
+    elif comparing and copying and not paused and not resuming:
         shown = ", ".join(str(name).rsplit("\\", 1)[-1] for name in comparing[:3])
         more = f" and {len(comparing) - 3} more" if len(comparing) > 3 else ""
         in_flight = f"Comparing with the backup copy: {shown}{more}"
@@ -418,7 +484,8 @@ def run_panel(observed: ObservedRun, places: Places = NO_PLACES) -> RunPanel:
                     can_resume=live and paused and cancelling is None,
                     can_cancel=live and cancelling is None,
                     can_stop_now=live and cancelling is CancelMode.GRACEFUL,
-                    note=waiting_note(st) if waiting else identical_words(identical))
+                    note=waiting_note(st) if waiting or resuming else identical_words(identical),
+                    resuming=resuming, can_run_next=live and can_move_up(st))
 
 
 def identical_words(files_identical: int) -> str:
@@ -436,6 +503,9 @@ def _percent(got, total) -> str:
 
 REQUEST_TITLES = {"pause": "Not paused", "resume": "Not resumed", "cancel": "Not cancelled", "stop": "Not stopped"}
 """The title of what the window says when a request did not reach its run, by what was asked."""
+
+NOT_MOVED = "Not moved"
+"""The same for *Run next*."""
 
 
 def not_reached_words(verification: bool, reason: str = "", *, repair: bool = False) -> str:

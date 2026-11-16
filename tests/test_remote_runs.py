@@ -28,6 +28,7 @@ import re
 import shutil
 import socket
 import sys
+import threading
 import time
 import unittest
 import uuid
@@ -36,7 +37,7 @@ from pathlib import Path
 from unittest import mock
 
 from support import GIB, endpoint, remove_temporary_folder, temporary_folder, volume
-from test_engine_contract import BACKENDS, ENGINE, Loopback, MiB, needs_engine
+from test_engine_contract import BACKENDS, ENGINE, Loopback, MiB, needs_engine, wait_for
 
 from mirrorhold.automation.arrival import arrival_selection, destination_key, source_key
 from mirrorhold.automation.automatic import run_scheduled
@@ -57,6 +58,8 @@ from mirrorhold.engine.remote import RemoteError, Space as ServiceSpace
 from mirrorhold.maintenance.cleanup import CleanupReport, ExpiredBatch
 from mirrorhold.records.record import (DONE_KEYS, LEFT_KEYS, PLANNED_KEYS, RECORD_SCHEMA, Outcome, RunRecord,
                                        VersionsCleaned, read_records, write_record)
+from mirrorhold.records.admission import CONFIGURATION, Claim, WaitedFor
+from mirrorhold.records.status import LiveStatus, Phase, StatusBoard, observe_runs
 from mirrorhold.run import apply
 from mirrorhold.run.gate import Space, Stop, Verdict, judge
 from mirrorhold.endpoints.shared import SHARED_RELATIVE
@@ -234,6 +237,58 @@ class FirstAndNextRunTest(RemoteRunCase):
         self.assertEqual(self.files(root), {"a.txt": 1})
 
 
+class RemoteTurnTest(RemoteRunCase):
+    """A run reaches the remotes only while it works on a remote destination (the maintainer's
+    decision of 2026-11-10): while another activity reaches one, the run backs up its drive
+    destination first and waits for the configuration's turn for its remote one, which it then
+    reaches through a session of its own."""
+
+    def test_a_remote_destination_waits_for_the_configuration_while_the_drive_one_is_backed_up(self):
+        vol_d = self.base / "volD"
+        vol_d.mkdir()
+        d = volume(2, mounts=(str(vol_d) + "\\",), label="D")
+        self.volumes = FixedVolumeSource((self.s, d))
+        write(self.vol_s / "Work", "a.txt", "a")
+        root = self.loopback.root_of("local", f"{self.case}-turn")
+        job = new_job("Work", endpoint(self.s, "Work"), [RemoteEndpoint(root.remote, root.folder), endpoint(d, "Backup")])
+        self.save(job)
+        claim = Claim((endpoint(self.s, "Other"),), (RemoteEndpoint(root.remote, f"{root.folder}-other"),))
+        other = StatusBoard(self.layout, LiveStatus(uuid.uuid4().hex, os.getpid(), "o" * 32, "Other", "manual",
+                                                    "2026-11-10T10:00:00Z", admitted=True, claim=claim.to_document(),
+                                                    phase=Phase.COPYING))
+        other.open()
+        self.addCleanup(other.close)
+        box = {}
+
+        def target():
+            try:
+                box["result"] = self.run_now(job, first_backup=True)
+            except BaseException as exc:  # handed to the test thread below
+                box["error"] = exc
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+
+        def between():
+            return next((r.status for r in observe_runs(self.layout) if r.alive and r.status.get("job_id") == job.job_id
+                         and r.status.get("waiting_for") and r.status.get("finished")), None)
+
+        waiting = wait_for(between, timeout=60)
+        self.assertIsNotNone(waiting, "the run never waited for its remote destination's turn")
+        self.assertEqual(waiting["finished"], [[2, Outcome.COMPLETED.value]])
+        self.assertEqual(WaitedFor.from_status(waiting), WaitedFor(other.status.run_id, "run", "Other",
+                                                                   drive=CONFIGURATION))
+        other.close()
+        thread.join(180)
+        self.assertFalse(thread.is_alive(), "the run did not end")
+        if "error" in box:
+            raise box["error"]
+        records = box["result"].records
+        self.assertEqual([(r.destination_index, r.outcome) for r in records],
+                         [(2, Outcome.COMPLETED), (1, Outcome.COMPLETED)], records)
+        self.assertEqual(self.files(root), {"a.txt": 1})
+
+
 class HeldRunTest(RemoteRunCase):
     def test_removals_above_the_threshold_are_held_and_a_confirmed_preview_applies_them(self):
         for backend in ("s3", "local"):
@@ -376,6 +431,31 @@ class FilesTest(RemoteRunCase):
                                         "converges")
         self.assertEqual(self.only(self.run_now(job)).outcome, Outcome.COMPLETED)
         self.assertEqual(self.files(root), {"a.txt": 1, "b.txt": 2})
+
+    def test_after_the_copy_only_the_folders_no_placed_file_lies_in_are_asked_about(self):
+        """A folder a file the engine copied lies in is there once the copy ends, so the
+        folder step asks the remote about the empty folders alone; each question is a request
+        to the service."""
+        job, root = self.job_onto("local")
+        self.seed(job, {"a.txt": "a"})
+        write(self.vol_s / "Work", "full/deeper/b.txt", "bb")
+        (self.vol_s / "Work" / "empty" / "inner").mkdir(parents=True)
+        asked = []
+        is_folder = RemoteStorage.is_folder
+
+        def watched(storage, relative=""):
+            asked.append(relative)
+            return is_folder(storage, relative)
+
+        with mock.patch.object(RemoteStorage, "is_folder", autospec=True, side_effect=watched):
+            record = self.only(self.run_now(job))
+        self.assertEqual(record.outcome, Outcome.COMPLETED, record)
+        self.assertEqual(self.files(root), {"a.txt": 1, "full\\deeper\\b.txt": 2})
+        self.assertNotIn("full", asked)
+        self.assertNotIn("full\\deeper", asked)
+        self.assertIn("empty", asked)
+        self.assertIn("empty\\inner", asked)
+        self.assertIsNotNone(self.session.stat(root, "empty\\inner"))
 
     def test_a_free_space_the_service_reports_without_a_total_is_judged(self):
         job, root = self.job_onto("local")

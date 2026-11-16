@@ -58,7 +58,7 @@ from mirrorhold.tray import start_detached
 
 from .common_view import apply_icon, apply_style, claim_identity, prepare_display
 from .refresh import RunsLook, RunWatcher
-from .runs_model import (NO_PLACES, Places, RunPanel, can_ask_cancel, can_ask_pause, cancel_words,
+from .runs_model import (NO_PLACES, RUN_NEXT, Places, RunPanel, can_ask_cancel, can_ask_pause, cancel_words,
                          destination_places, pause_words)
 from .runs_view import RunRequests
 from .tray_model import (CHECK_SECONDS, OPEN_PATIENCE, TITLE, WINDOW_PROPERTY, Lifetime, MissingWatch, TrayLook,
@@ -249,7 +249,7 @@ class TrayIcon:
         self.host.attributes("-alpha", 0.0)
         self._warnings = 0                # native warnings open over the host, which Tk does not list
         self.requests = RunRequests(self._question_parent, layout, self.statuses_of, timer=root, warn=self.warn,
-                                    places=lambda: self.places)
+                                    places=lambda: self.places, statuses=lambda: self.statuses.values())
         self._click = root.register(self.open_window)
         self._popup = root.register(self.popup)
 
@@ -296,7 +296,7 @@ class TrayIcon:
             if latest.failed:
                 raise OSError(latest.failed)
             look = tray_look(latest.runs, reminder_lines(self.layout), self.places)
-            statuses = {r.run_id: r.status for r in latest.runs if r.readable}
+            statuses = {r.run_id: r.status for r in latest.runs if r.readable and r.alive}
         except Exception:  # whether an activity works cannot be told from this look
             lines = reminder_lines(self.layout)
             if not lines:
@@ -418,6 +418,9 @@ class TrayIcon:
             menu.add_command(label=dismiss_words(len(lines)), command=self.dismiss)
 
     def _add_requests(self, menu: tk.Menu, panel: RunPanel) -> None:
+        if panel.waiting and not panel.verification:
+            menu.add_command(label=RUN_NEXT, state="normal" if panel.can_run_next else "disabled",
+                             command=lambda: self._ask(panel.run_id, self.requests.run_next))
         menu.add_command(label=pause_words(panel), state="normal" if can_ask_pause(panel) else "disabled",
                          command=lambda: self._ask(panel.run_id, self.requests.pause_or_resume))
         menu.add_command(label=cancel_words(panel), state="normal" if can_ask_cancel(panel) else "disabled",

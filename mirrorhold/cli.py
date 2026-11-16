@@ -3,7 +3,8 @@
     python -m mirrorhold [--store FILE] <command> ...
 
     volumes                         the volumes present now, and those that cannot be read
-    jobs                            the stored jobs, each with its group
+    jobs                            the stored jobs, each with its group and the destinations
+                                    switched off
     add NAME --source DIR (--dest DIR | --remote-dest REMOTE:FOLDER) [...] [--no-survey]
                                     destinations in the order given; REMOTE names a remote of
                                     the rclone configuration ``remotes`` sets
@@ -26,6 +27,8 @@
     preview JOB [--dest N ... | --marker ID ...] [--move]
                                     what a run would do now, its estimate, and a ticket to confirm it
     run JOB [--dest N ... | --marker ID ...] [--confirm TICKET | --first-backup] [--unattended]
+                                    the destinations named, whatever their switches, or every
+                                    one switched on; --unattended never runs one switched off
     verify JOB [--dest N | --marker ID] [--new-copies] [--restart]
                                     a full verification of one destination: both copies of every
                                     file read in full and compared; continues a stopped one.
@@ -37,14 +40,20 @@
                                     source's copy is copied in its place, and both are read back
     status                          the runs, verifications and repairs in progress, in line order
     history JOB [--limit N]         the job's run, verification and repair records, newest last
-    pause [RUN] / resume [RUN]      pause or resume a run, verification or repair in progress
+    pause [RUN] / resume [RUN]      pause or resume a run, verification or repair in progress;
+                                    what waits only for its drives then starts, and it takes
+                                    them back when they are free
     cancel [RUN] [--now]            cancel a run or a repair: after its files in flight, or at
                                     once; a verification stops at once either way
-    when JOB [--arrival on|off] [--schedule SPEC|none] [--automatic on|off]
+    next RUN                        move a waiting run or repair to the front of the line
+    when JOB [--arrival on|off] [--schedule SPEC|none]
+             [--automatic on|off [--dest N ... | --marker ID ...]]
                                     when the job runs by itself (SPEC: days, then times:
                                     "daily 21:00", "weekly mon,thu 09:00,21:00",
                                     "monthly 15 22:00", "monthly last every 2h 08:00-23:00";
-                                    --automatic off pauses both)
+                                    --automatic switches the destinations named, or every
+                                    one: a destination switched off is left out of every run
+                                    that names no destination, automatic runs included)
     install / uninstall             set up, or remove, the copy its tasks and Start menu entry
                                     start: from a working copy, a copy built in installed/;
                                     in a portable release, the release where it lies
@@ -53,7 +62,7 @@
                                     what the setup program's uninstaller asks
     installation                    which copy is set up for this store
     reconcile                       bring the scheduled tasks into line with the jobs
-    automatic JOB --by arrival|schedule
+    automatic JOB --by arrival|schedule|logon
                                     what a scheduled task runs (unattended)
 
 JOB is a job's identifier, a unique prefix of it, or its exact name; RUN a unique prefix
@@ -110,10 +119,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
-from .automation.automatic import run_on_arrival, run_scheduled
+from .automation.automatic import run_at_logon, run_on_arrival, run_scheduled
 from .automation.reconcile import AutomationState, apply_automation
 from .automation.scheduler import Scheduler
-from .automation.tasks import ARRIVAL, SCHEDULE
+from .automation.tasks import ARRIVAL, LOGON, SCHEDULE
 from .contract_errors import ContractError
 from .endpoints.cloud import SyncRoot, sync_roots_on_this_computer
 from .endpoints.endpoint import RemoteEndpoint
@@ -141,8 +150,8 @@ from .planning.sharing import Sharing
 from .records import diagnostics
 from .records.record import FIRST_RUN_REASON, Outcome, read_records
 from .records.admission import WaitedFor, line_words, starting
-from .records.status import (ANY_KIND, KIND_REPAIR, KIND_VERIFICATION, UNREADABLE, CancelMode, NoSuchRun, find_run,
-                             is_repair, is_verification, line_order, observe_runs, request)
+from .records.status import (ANY_KIND, KIND_REPAIR, KIND_VERIFICATION, UNREADABLE, CancelMode, NoSuchRun, Phase,
+                             find_run, is_repair, is_verification, line_order, observe_runs, request, run_next)
 from .reminders import reminding
 from .remotes import seal
 from .remotes.facts import Reach
@@ -174,20 +183,29 @@ class _Usage(Exception):
 
 
 def _automatic(job: Job) -> bool:
-    return job.enabled and job.triggers.automatic
+    return bool(job.switched_on) and job.triggers.automatic
+
+
+def _numbers(numbers: Sequence[int]) -> str:
+    """'destination 2', 'destinations 2 and 4', 'destinations 1, 2 and 4'."""
+    words = [str(n) for n in numbers]
+    listed = words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+    return f"destination{'s' if len(words) > 1 else ''} {listed}"
 
 
 def _when(job: Job) -> str:
-    """When the job runs, in words."""
+    """When the job runs, in words, with the destinations switched off."""
     parts = ["when you start it"]
     if job.triggers.on_arrival:
         parts.append("when one of its drives is attached (also at start-up)")
     if job.triggers.schedule is not None:
         parts.append(parse_schedule(job.triggers.schedule).describe().lower())
+    if not job.switched_on:
+        paused = f"; automatic runs paused: {'; '.join(parts[1:])}" if job.triggers.automatic else ""
+        return f"when you start it naming its destinations (every destination switched off{paused})"
     text = "; also ".join(parts) if len(parts) > 1 else parts[0]
-    if job.triggers.automatic and not job.enabled:
-        text = f"when you start it (automatic runs paused: {'; '.join(parts[1:])})"
-    return text
+    off = [n for n in range(1, len(job.destinations) + 1) if n not in job.switched_on]
+    return text + (f" ({_numbers(off)} switched off)" if off else "")
 
 
 def _destination_options(command: argparse.ArgumentParser, *, many: bool) -> None:
@@ -261,17 +279,19 @@ def _parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel")
     cancel.add_argument("run", nargs="?")
     cancel.add_argument("--now", action="store_true")
+    sub.add_parser("next").add_argument("run")
     when = sub.add_parser("when")
     when.add_argument("job")
     when.add_argument("--arrival", choices=("on", "off"))
     when.add_argument("--schedule", metavar="SPEC")
     when.add_argument("--automatic", choices=("on", "off"))
+    _destination_options(when, many=True)
     for name in ("install", "installation", "reconcile"):
         sub.add_parser(name)
     sub.add_parser("uninstall").add_argument("--if-set-up-here", action="store_true")
     automatic = sub.add_parser("automatic")
     automatic.add_argument("job")
-    automatic.add_argument("--by", required=True, choices=(ARRIVAL, SCHEDULE))
+    automatic.add_argument("--by", required=True, choices=(ARRIVAL, SCHEDULE, LOGON))
     return parser
 
 
@@ -426,7 +446,7 @@ def _cmd_jobs(s: _Session) -> int:
         s.say(f"    runs         {_when(job)}")
         s.say(f"    source       {job.source.endpoint.describe()}")
         for i, d in enumerate(job.destinations, 1):
-            s.say(f"    destination {i} {_destination_words(d.endpoint)}")
+            s.say(f"    destination {i} {_destination_words(d.endpoint)}{'' if d.switched_on else ' [switched off]'}")
     return EXIT_OK
 
 
@@ -955,6 +975,14 @@ def _waited_for(st: dict) -> Optional[str]:
     return text
 
 
+def _paused(st: dict) -> str:
+    """" [paused]", or what one asked to work again waits for while its drives are not back."""
+    if st.get("resuming"):
+        other = _waited_for(st)
+        return f" [resuming, waiting for {other}]" if other is not None else " [resuming]"
+    return " [paused]" if st.get("paused") else ""
+
+
 def _waiting(st: dict) -> str:
     """What a waiting run or repair waits for: the activity its status names; "starting" for
     one of this copy starting (``records.admission.starting``); its turn, for one of this
@@ -970,7 +998,7 @@ def _waiting(st: dict) -> str:
 
 def _say_verification(s: _Session, head: str, st: dict) -> None:
     verify = st.get("verify") or {}
-    flags = " [paused]" if st.get("paused") else ""
+    flags = _paused(st)
     what = "verification of new copies of" if verify.get("mode") == VerificationMode.NEW_COPIES.value \
         else "verification of"
     s.say(head + f"  {what} {st.get('destination')}")
@@ -997,7 +1025,7 @@ def _say_verification(s: _Session, head: str, st: dict) -> None:
 
 
 def _say_repair(s: _Session, head: str, st: dict) -> None:
-    flags = (" [paused]" if st.get("paused") else "") + (" [stopping]" if st.get("cancelling") else "")
+    flags = _paused(st) + (" [stopping]" if st.get("cancelling") else "")
     s.say(head + f"  repair of {st.get('destination')}")
     if st.get("phase") == "waiting":
         s.say(f"    {_waiting(st)}" + flags)
@@ -1031,8 +1059,7 @@ def _cmd_status(s: _Session) -> int:
         if is_repair(st):
             _say_repair(s, head, st)
             continue
-        flags = (" [paused]" if st.get("paused") else "") + \
-                (f" [cancelling: {st['cancelling']}]" if st.get("cancelling") else "")
+        flags = _paused(st) + (f" [cancelling: {st['cancelling']}]" if st.get("cancelling") else "")
         s.say(head)
         if st.get("phase") == "waiting":
             s.say(f"    {_waiting(st)}" + flags)
@@ -1096,18 +1123,45 @@ def _cmd_cancel(s: _Session) -> int:
     return _control(s, cancel=CancelMode.IMMEDIATE if s.args.now else CancelMode.GRACEFUL)
 
 
+def _cmd_next(s: _Session) -> int:
+    layout = runtime_layout(s.store.path)
+    observed = find_run(layout, s.args.run)
+    status = observed.status
+    if not observed.readable or status.get("phase") != Phase.WAITING.value:
+        raise _Usage(f"run {observed.run_id[:12]} does not wait for its turn")
+    if is_verification(status):
+        raise _Usage("a verification waits behind every run and repair: it cannot be moved to the front")
+    try:
+        run_next(layout, observed.run_id)
+    except FileBusy:
+        raise _Usage(REQUEST_NOT_WRITTEN) from None
+    s.say(f"run {observed.run_id[:12]} ('{status.get('job_name')}'): moved to the front of the line")
+    return EXIT_OK
+
+
 def _cmd_when(s: _Session) -> int:
     contents = s.load()
     job = s.find(contents, s.args.job)
-    on_arrival, schedule, enabled = job.triggers.on_arrival, job.triggers.schedule, job.enabled
+    if (s.args.dest or s.args.marker) and s.args.automatic is None:
+        raise _Usage("--dest and --marker name the destinations --automatic switches")
+    on_arrival, schedule, destinations = job.triggers.on_arrival, job.triggers.schedule, job.destinations
     if s.args.arrival is not None:
         on_arrival = s.args.arrival == "on"
     if s.args.schedule is not None:
         schedule = None if s.args.schedule.strip().lower() == "none" else s.args.schedule
     if s.args.automatic is not None:
-        enabled = s.args.automatic == "on"
+        on = s.args.automatic == "on"
+        markers = s.markers(job, s.args.marker)
+        try:
+            named = ({job.destination_number(marker=m) for m in markers} if markers is not None
+                     else {job.destination_number(n) for n in s.args.dest} if s.args.dest
+                     else set(range(1, len(job.destinations) + 1)))
+        except ValueError as exc:
+            raise _Usage(str(exc)) from None
+        destinations = tuple(replace(d, switched_on=on) if n in named else d
+                             for n, d in enumerate(job.destinations, 1))
     try:
-        changed = replace(job, triggers=Triggers(on_arrival, schedule), enabled=enabled)
+        changed = replace(job, triggers=Triggers(on_arrival, schedule), destinations=destinations)
     except ContractError as exc:
         raise _Usage(f"not a schedule: {exc}") from None
     s.save(contents.with_job(changed))
@@ -1205,10 +1259,8 @@ def _cmd_reconcile(s: _Session) -> int:
 def _cmd_automatic(s: _Session) -> int:
     diagnostics.mark(diagnostics.JOB, job=s.args.job)
     common = dict(volume_source=s.volume_source(), sync_roots=s.sync_roots(), notifier=s.notifier)
-    if s.args.by == ARRIVAL:
-        result = run_on_arrival(s.store, s.args.job, **common)
-    else:
-        result = run_scheduled(s.store, s.args.job, **common)
+    automatic = {ARRIVAL: run_on_arrival, LOGON: run_at_logon, SCHEDULE: run_scheduled}[s.args.by]
+    result = automatic(s.store, s.args.job, **common)
     for run in result.runs:
         for record in run.records:
             s.say(record.describe())
@@ -1226,7 +1278,8 @@ _COMMANDS = {"volumes": _cmd_volumes, "jobs": _cmd_jobs, "add": _cmd_add, "remov
              "unlock": _cmd_unlock, "preview": _cmd_preview, "run": _cmd_run,
              "verify": _cmd_verify, "repair": _cmd_repair,
              "status": _cmd_status, "history": _cmd_history, "pause": _cmd_pause, "resume": _cmd_resume,
-             "cancel": _cmd_cancel, "when": _cmd_when, "install": _cmd_install, "uninstall": _cmd_uninstall,
+             "cancel": _cmd_cancel, "next": _cmd_next, "when": _cmd_when, "install": _cmd_install,
+             "uninstall": _cmd_uninstall,
              "installation": _cmd_installation, "reconcile": _cmd_reconcile, "automatic": _cmd_automatic}
 
 

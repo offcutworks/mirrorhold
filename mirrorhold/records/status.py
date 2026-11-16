@@ -10,16 +10,19 @@ run identifier:
   the destinations it serves (none named: every one, as an older copy publishes) and,
   for a run, the marker of each destination by the number it gives it — the job's order
   when the run began, which an edit of the job since may have changed, so an observer
-  finds a destination by its marker, never by its number — the pair in progress, how
+  finds a destination by its marker, never by its number — the destinations it has
+  finished, the pair in progress (none while it waits between two), how
   many entries the listing in progress has seen, how many of the changed files the step
   in progress has examined (their signatures read while planning, each opened before
   the copy), the plan's totals and what is done against them (files found identical
   included), the files in flight and the files the engine is comparing, rate and time left, and whether it is paused or cancelling; and what
   admission needs (``records.admission``): the folders it reads and writes and the
-  drives they lie on, whether it holds them, what it waits for and its place in line,
-  and what its gate let it write on its destination's drive;
-- ``<run>.control`` — the state its callers want: paused or not, and whether to cancel
-  (gracefully or at once). A caller writes the wanted state; the run reconciles to it.
+  drives they lie on, whether it holds them, what it waits for and its place in line, whether
+  it was asked to work again after a pause and waits for its drives, and what its gate let it
+  write on its destination's drive;
+- ``<run>.control`` — the state its callers want: paused or not, whether to cancel
+  (gracefully or at once), and the place in line the user moved it to. A caller writes the
+  wanted state; the run reconciles to it.
   Wanted state rather than a queue of commands, so two callers compose and a repeated
   request changes nothing. A request reads, changes and writes it while holding
   ``<run>.request``, a lock of requests alone, there only while one holds it and named so
@@ -33,7 +36,8 @@ holds the turn writes only while that lock is held: a request made as the run en
 lands before the control file is removed or finds the run ended and writes nothing, so no
 control file outlives its run. A status file whose
 lock is free belongs to a run that died; ``reap_interrupted`` turns it into an
-interrupted record for the pair it was working on. The lock is taken before the first
+interrupted record for the pair it was working on, or, where it worked on none, for each
+destination it had not finished. The lock is taken before the first
 status is written and given up after the last is removed, and a look in the folder can
 meet a status at the instant it is renamed over and find no file (measured on the
 development machine: about one look in a hundred thousand while another process
@@ -66,7 +70,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -74,7 +78,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from ..locations import RuntimeLayout
 from .. import exchange
 from .lock import FileLock, is_held_elsewhere
-from .record import DONE_KEYS, LEFT_KEYS, PLANNED_KEYS, Outcome, RunRecord, json_text, utc_now, write_record
+from .record import (DONE_KEYS, LEFT_BY_USER, LEFT_KEYS, NEVER_BEGUN, PLANNED_KEYS, PROCESS_ENDED, Outcome, RunRecord,
+                     json_text, utc_now, write_record)
 
 STATUS_FORMAT = "mirrorhold-run-status"
 
@@ -105,13 +110,15 @@ class CancelMode(str, Enum):
 
 @dataclass(frozen=True)
 class Wanted:
-    """What callers want of a run."""
+    """What callers want of a run: ``queued``, the place in line the user moved it to
+    (``run_next``), None where it keeps the one it joined at."""
 
     paused: bool = False
     cancel: Optional[CancelMode] = None
+    queued: Optional[str] = None
 
     def to_document(self) -> dict:
-        return {"paused": self.paused, "cancel": self.cancel.value if self.cancel else None}
+        return {"paused": self.paused, "cancel": self.cancel.value if self.cancel else None, "queued": self.queued}
 
     @classmethod
     def from_document(cls, doc: Any) -> "Wanted":
@@ -122,7 +129,8 @@ class Wanted:
             mode = CancelMode(cancel) if cancel else None
         except ValueError:
             mode = None
-        return cls(bool(doc.get("paused")), mode)
+        queued = doc.get("queued")
+        return cls(bool(doc.get("paused")), mode, queued if isinstance(queued, str) and queued else None)
 
 
 def queue_time() -> str:
@@ -170,6 +178,7 @@ class LiveStatus:
     waiting_for: Optional[Dict[str, Any]] = None           # while it waits: the activity it waits for
     place: int = 0                                         # while it waits: its place in line, 1 the next to go
     writing: Optional[Dict[str, Any]] = None               # the pair's drive and what its gate let it copy
+    resuming: bool = False                                 # paused, asked to work again, its drives not back yet
 
     def to_document(self) -> dict:
         return {"format": STATUS_FORMAT, "run_id": self.run_id, "pid": self.pid, "job_id": self.job_id,
@@ -189,6 +198,7 @@ class LiveStatus:
                 "waiting_for": dict(self.waiting_for) if self.waiting_for is not None else None,
                 "place": self.place,
                 "writing": dict(self.writing) if self.writing is not None else None,
+                "resuming": self.resuming,
                 "updated": utc_now()}
 
 
@@ -423,17 +433,23 @@ def place_of(status: Mapping[str, Any]) -> int:
     return place if isinstance(place, int) and not isinstance(place, bool) and place > 0 else 0
 
 
+def _line_time(status: Mapping[str, Any]) -> str:
+    """When an activity joined the line, to the microsecond (an older copy's status says only
+    when it started, to the second, read as that second's start so that it compares with the
+    microseconds)."""
+    when = str(status.get("queued") or status.get("started") or "")
+    if when.endswith("Z") and "." not in when:
+        when = when[:-1] + ".000000Z"
+    return when
+
+
 def line_order(observed: ObservedRun) -> Tuple[int, int, str, str]:
     """Where an activity stands in line, as a sort key: those at work or paused first, then
     the waiting ones by their place in line, one naming no place last; each in the order it
-    joined the line (to the microsecond; an older copy's status says only when it started,
-    to the second, read as that second's start so that it compares with the microseconds).
-    The activities a group or several items start share their start's second, so when they
-    started says nothing of their order."""
+    joined the line. The activities a group or several items start share their start's
+    second, so when they started says nothing of their order."""
     st = observed.status
-    when = str(st.get("queued") or st.get("started") or "")
-    if when.endswith("Z") and "." not in when:
-        when = when[:-1] + ".000000Z"
+    when = _line_time(st)
     if st.get("phase") != Phase.WAITING.value:
         return 0, 0, when, observed.run_id
     return 1, place_of(st) or 1 << 30, when, observed.run_id
@@ -472,9 +488,11 @@ def find_run(layout: RuntimeLayout, key: Optional[str]) -> ObservedRun:
 
 
 def request(layout: RuntimeLayout, run_id: str, *, pause: Optional[bool] = None,
-            cancel: Optional[CancelMode] = None, patience: float = REQUEST_PATIENCE) -> Wanted:
+            cancel: Optional[CancelMode] = None, queued: Optional[str] = None,
+            patience: float = REQUEST_PATIENCE) -> Wanted:
     """Change what is wanted of a run. A cancel is never downgraded: an immediate cancel
-    stays immediate. Requests to one run take turns (``<run>.request``, removed as each lets
+    stays immediate. ``queued``: its new place in line (``run_next``).
+    Requests to one run take turns (``<run>.request``, removed as each lets
     it go), so what one wanted is never dropped by another made at the same instant; an
     ending run holds that turn while it removes its files (``StatusBoard.close``).
     FileBusy when the turn or the run's control file stayed held for ``patience`` seconds:
@@ -496,18 +514,64 @@ def request(layout: RuntimeLayout, run_id: str, *, pause: Optional[bool] = None,
         mode = current.cancel
         if cancel is not None and mode is not CancelMode.IMMEDIATE:
             mode = cancel
-        wanted = Wanted(paused, mode)
+        wanted = Wanted(paused, mode, queued or current.queued)
         _write_atomically(path, wanted.to_document(), patience=patience, staging=exchange.private_staging(path))
     finally:
         turn.release(remove=True)
     return wanted
 
 
+def _moment(status: Mapping[str, Any]) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(_line_time(status).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def run_next(layout: RuntimeLayout, run_id: str, *, patience: float = REQUEST_PATIENCE) -> Wanted:
+    """Move the waiting run or repair ``run_id`` to the front of the line: its place becomes
+    a moment before that of everyone who waits now, itself included, so the last one moved goes
+    first. Raises as ``request`` does; a verification stays behind every run and repair
+    wherever it stands (``admission.goes_first``), so none is moved."""
+    waiting = [_moment(r.status) for r in observe_runs(layout)
+               if r.alive and r.readable and r.status.get("phase") == Phase.WAITING.value]
+    first = min((moment for moment in waiting if moment is not None), default=datetime.now(timezone.utc))
+    front = (first - timedelta(microseconds=1)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return request(layout, run_id, queued=front, patience=patience)
+
+
+def _unworked(run_id: str, doc: Mapping[str, Any], reasons: Tuple[str, ...]) -> List[RunRecord]:
+    """A record of each destination a dead run was to serve and never reached: one that
+    waited for its turn above all, or one waiting for a turn between two of its
+    destinations, whose finished ones its status names and keep their records. One whose
+    status names no destinations, an older copy's, leaves none."""
+    markers = doc.get("markers") if isinstance(doc.get("markers"), list) else []
+    selected = doc.get("selected") if isinstance(doc.get("selected"), list) else []
+    done = doc.get("finished") if isinstance(doc.get("finished"), list) else []
+    finished = {entry[0] for entry in done if isinstance(entry, list) and entry and isinstance(entry[0], int)}
+    detail = ("the run's process ended before the run reached this destination (shutdown, unplugging or a crash); "
+              "nothing was written there, and the next run converges" if finished else
+              "the run's process ended before the run began (shutdown, unplugging or a crash); "
+              "nothing was written, and the next run converges")
+    records = []
+    for index in selected or range(1, len(markers) + 1):
+        if isinstance(index, int) and 0 < index <= len(markers) and index not in finished:
+            records.append(RunRecord(run_id, doc.get("job_id", ""), doc.get("job_name", ""), markers[index - 1], index,
+                                     doc.get("trigger", ""), doc.get("started") or utc_now(),
+                                     doc.get("updated") or utc_now(), Outcome.INTERRUPTED, reasons, detail,
+                                     doc.get("engine_version"), dict.fromkeys(PLANNED_KEYS, 0),
+                                     dict.fromkeys(DONE_KEYS, 0), dict.fromkeys(LEFT_KEYS, 0)))
+    return records
+
+
 def reap_interrupted(layout: RuntimeLayout) -> List[RunRecord]:
-    """Record every dead run as interrupted (for the pair it was working on) and remove its
-    status files; a dead verification's or repair's are removed with no run record. A live
-    run's files are never touched. Called as an activity is admitted, under the admission
-    lock (``records.admission``), so no dead run is recorded twice; and a dead run is
+    """Record every dead run as interrupted (for the pair it was working on, or, when it
+    worked on none — waiting for its turn, first or between two of its destinations — for
+    each destination it was to serve and had not finished) and remove its status files, with
+    whether the user had paused it or asked it to stop; a dead verification's or repair's are
+    removed with no run record. A live run's files are never touched. Called under the
+    admission lock (``records.admission``) — as an activity is admitted, or at logon
+    (``admission.settle_interrupted``) — so no dead run is recorded twice; and a dead run is
     recorded only once its status file is gone, so a status another program holds is left
     to a later admission rather than recorded at each."""
     reaped = []
@@ -518,6 +582,8 @@ def reap_interrupted(layout: RuntimeLayout) -> List[RunRecord]:
         paths = _paths(layout, observed.run_id)
         if not exchange.remove(paths["status"]):
             continue
+        held_by_user = doc.get("cancelling") or (doc.get("paused") and not doc.get("resuming"))
+        left_by_user = (LEFT_BY_USER,) if held_by_user else ()
         if is_run(doc) and doc.get("pair_index") and doc.get("marker_id") and doc.get("pair_started"):
             planned = {k: int((doc.get("planned") or {}).get(k, 0)) for k in PLANNED_KEYS}
             done = {k: int((doc.get("done") or {}).get(k, 0)) for k in DONE_KEYS}
@@ -529,11 +595,15 @@ def reap_interrupted(layout: RuntimeLayout) -> List[RunRecord]:
             left["renames"] = max(0, planned["renames"] - done["renamed"])
             record = RunRecord(observed.run_id, doc.get("job_id", ""), doc.get("job_name", ""), doc["marker_id"],
                                int(doc["pair_index"]), doc.get("trigger", ""), doc["pair_started"],
-                               doc.get("updated") or utc_now(), Outcome.INTERRUPTED, ("process-ended",),
+                               doc.get("updated") or utc_now(), Outcome.INTERRUPTED, (PROCESS_ENDED, *left_by_user),
                                "the run's process ended before the run did (shutdown, unplugging or a crash); "
                                "the next run converges", doc.get("engine_version"), planned, done, left)
             write_record(layout, record)
             reaped.append(record)
+        elif is_run(doc):
+            for record in _unworked(observed.run_id, doc, (NEVER_BEGUN, *left_by_user)):
+                write_record(layout, record)
+                reaped.append(record)
         for name in ("control", "request", "files", "lock"):
             exchange.remove(paths[name], patience=0.0)
     return reaped

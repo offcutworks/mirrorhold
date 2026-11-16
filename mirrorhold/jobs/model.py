@@ -5,12 +5,17 @@ through these types, and the core re-validates a job against them whenever it
 loads one, never trusting that the caller did.
 
 A job has one source, one or more destinations, triggers, hold thresholds, a version
-cleanup setting and a verification reminder. Thresholds and cleanup belong to the
-job, not to a destination. Each destination also carries STATE (whether its first
-run was confirmed, its last success, its last full verification), which is not
-configuration and is not stored with it. A destination is a folder of this computer's
-drives or of a remote of the user's rclone configuration (``endpoints.endpoint``); the
-source is always a folder of this computer.
+cleanup setting and a verification reminder. Each destination has a switch
+(``Destination.switched_on``): a run of the job that names no destination — every
+automatic run, and a run the user starts of the job whole — serves only those switched
+on, and an automatic run never serves one switched off; a destination named by the user
+runs whatever its switch. A job with every destination switched off runs nothing by
+itself, its triggers kept. Thresholds and cleanup belong to the job, not to a
+destination. Each destination also carries STATE (whether its first run was confirmed,
+its last success, its last full verification), which is not configuration and is not
+stored with it. A destination is a folder of this computer's drives or of a remote of
+the user's rclone configuration (``endpoints.endpoint``); the source is always a folder
+of this computer.
 
 Which rclone configuration the remotes are reached through, and how it is unlocked, is
 one setting for every job (``RemoteSettings``, in the preferences): only the file's path
@@ -140,11 +145,13 @@ class Source:
 class Destination:
     endpoint: AnyEndpoint
     marker_id: str = field(default_factory=new_id)
+    switched_on: bool = True
 
     def __post_init__(self):
         if not isinstance(self.endpoint, (Endpoint, RemoteEndpoint)):
             raise ContractError("endpoint", f"not a destination's folder: {self.endpoint!r}")
         _check_id(self.marker_id, "marker_id")
+        _check_bool(self.switched_on, "switched_on")
 
     @property
     def remote(self) -> Optional[RemoteEndpoint]:
@@ -152,12 +159,14 @@ class Destination:
         return self.endpoint if isinstance(self.endpoint, RemoteEndpoint) else None
 
     def to_document(self) -> dict:
-        return {"endpoint": self.endpoint.to_document(), "marker_id": self.marker_id}
+        return {"endpoint": self.endpoint.to_document(), "marker_id": self.marker_id,
+                "switched_on": self.switched_on}
 
     @classmethod
     def from_document(cls, doc: Any) -> "Destination":
-        require_keys(doc, "", ("endpoint", "marker_id"))
-        return cls(_decode("endpoint", lambda: endpoint_from_document(doc["endpoint"])), doc["marker_id"])
+        require_keys(doc, "", ("endpoint", "marker_id", "switched_on"))
+        return cls(_decode("endpoint", lambda: endpoint_from_document(doc["endpoint"])), doc["marker_id"],
+                   doc["switched_on"])
 
 
 @dataclass(frozen=True)
@@ -259,7 +268,6 @@ class Job:
     name: str
     source: Source
     destinations: Tuple[Destination, ...]
-    enabled: bool = True
     triggers: Triggers = field(default_factory=Triggers)
     holds: HoldThresholds = field(default_factory=HoldThresholds)
     version_cleanup: VersionCleanup = field(default_factory=VersionCleanup)
@@ -271,7 +279,6 @@ class Job:
             raise ContractError("name", "a job needs a name")
         if len(self.name) > MAX_NAME_LENGTH:
             raise ContractError("name", f"longer than {MAX_NAME_LENGTH} characters")
-        _check_bool(self.enabled, "enabled")
         destinations = tuple(self.destinations) if isinstance(self.destinations, (list, tuple)) else None
         if not destinations:
             raise ContractError("destinations", "a job needs at least one destination")
@@ -280,6 +287,23 @@ class Job:
             raise ContractError("destinations", "two destinations share a marker identity")
         object.__setattr__(self, "destinations", destinations)
         _check_int(self.verification_reminder_days, "verification_reminder_days", 1)
+
+    @property
+    def switched_on(self) -> Tuple[int, ...]:
+        """The numbers (1-based, in the job's order) of the destinations switched on: what a
+        run of the job that names none serves."""
+        return tuple(n for n, destination in enumerate(self.destinations, 1) if destination.switched_on)
+
+    def not_automatic(self, trigger: Optional[str] = None) -> str:
+        """Why the job does not run by itself now, by ``trigger`` ("arrival" or "schedule")
+        where one is named; "" when it does."""
+        if not self.switched_on:
+            return "every destination of the job is switched off"
+        if trigger == "arrival" and not self.triggers.on_arrival:
+            return "the job no longer runs when its drives are attached"
+        if trigger == "schedule" and self.triggers.schedule is None:
+            return "the job no longer runs on a schedule"
+        return ""
 
     def number_of(self, marker_id: str) -> Optional[int]:
         """The number (1-based, in the job's order) of the destination whose marker is
@@ -306,7 +330,6 @@ class Job:
     def to_document(self) -> dict:
         return {"id": self.job_id,
                 "name": self.name,
-                "enabled": self.enabled,
                 "source": self.source.to_document(),
                 "destinations": [d.to_document() for d in self.destinations],
                 "triggers": self.triggers.to_document(),
@@ -316,7 +339,7 @@ class Job:
 
     @classmethod
     def from_document(cls, doc: Any) -> "Job":
-        require_keys(doc, "", ("id", "name", "enabled", "source", "destinations", "triggers", "holds",
+        require_keys(doc, "", ("id", "name", "source", "destinations", "triggers", "holds",
                                "version_cleanup", "verification_reminder_days"))
         if not isinstance(doc["destinations"], list):
             raise ContractError("destinations", "expected a list")
@@ -326,7 +349,6 @@ class Job:
                    name=doc["name"],
                    source=_decode("source", lambda: Source.from_document(doc["source"])),
                    destinations=destinations,
-                   enabled=doc["enabled"],
                    triggers=_decode("triggers", lambda: Triggers.from_document(doc["triggers"])),
                    holds=_decode("holds", lambda: HoldThresholds.from_document(doc["holds"])),
                    version_cleanup=_decode("version_cleanup",

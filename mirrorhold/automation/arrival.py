@@ -9,11 +9,11 @@ present drive has arrived — the computer started with it attached. Removals ar
 by the same look, so a drive that left and came back arrives again.
 
 What runs (``arrival_selection``): the source's arrival runs every destination present
-and every remote one; a destination's arrival runs that destination. Nothing runs while
-the source is absent. A remote destination never arrives — no device event marks a
-network store, and it is never counted present here — so the source's arrival is what
-runs it, besides a schedule or the user; whether it can be reached then is the run's to
-find, and one that cannot is recorded as waiting.
+and every remote one; a destination's arrival runs that destination; a destination
+switched off is never run. Nothing runs while the source is absent. A remote destination
+never arrives — no device event marks a network store, and it is never counted present
+here — so the source's arrival is what runs it, besides a schedule or the user; whether
+it can be reached then is the run's to find, and one that cannot is recorded as waiting.
 """
 from __future__ import annotations
 
@@ -63,14 +63,16 @@ def present_keys(job: Job, volumes: Sequence[VolumeInfo]) -> FrozenSet[str]:
 
 
 def arrival_selection(job: Job, present: FrozenSet[str], arrived: FrozenSet[str]) -> Optional[Tuple[int, ...]]:
-    """The destinations (1-based) an arrival runs, or None when nothing should run."""
+    """The destinations (1-based) an arrival runs, or None when nothing should run; a
+    destination switched off is never one of them."""
     if source_key(job) not in present:
         return None
     if source_key(job) in arrived:
         chosen = [i for i, d in enumerate(job.destinations, 1)
-                  if d.remote is not None or destination_key(d.marker_id) in present]
+                  if d.switched_on and (d.remote is not None or destination_key(d.marker_id) in present)]
     else:
-        chosen = [i for i, d in enumerate(job.destinations, 1) if destination_key(d.marker_id) in arrived]
+        chosen = [i for i, d in enumerate(job.destinations, 1)
+                  if d.switched_on and destination_key(d.marker_id) in arrived]
     return tuple(chosen) or None
 
 

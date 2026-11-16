@@ -29,9 +29,9 @@ from mirrorhold.jobs.store import ConfigStore, LoadStatus, StoreBusy, StoreConfl
 from mirrorhold.locations import RuntimeLayout
 from mirrorhold.records.admission import Activity, Claim, WaitedFor, admit, blockers, live_activities
 from mirrorhold.records.lock import FileLock, is_held_elsewhere
-from mirrorhold.records.record import Outcome, read_records
-from mirrorhold.records.status import (MISSING_PATIENCE, CancelMode, LastRead, LiveStatus, NoSuchRun, ObservedRun,
-                                       StatusBoard, Wanted, find_run, observe_runs, reap_interrupted, request)
+from mirrorhold.records.record import LEFT_BY_USER, NEVER_BEGUN, PROCESS_ENDED, Outcome, cut_short, read_records
+from mirrorhold.records.status import (MISSING_PATIENCE, CancelMode, LastRead, LiveStatus, NoSuchRun, ObservedRun, Phase,
+                                       StatusBoard, Wanted, find_run, observe_runs, reap_interrupted, request, run_next)
 from mirrorhold.run.control import RunControl, StatusPump
 
 WINDOWS = sys.platform == "win32"
@@ -324,6 +324,53 @@ class StatusChannelTest(TempDirTest):
         pump.tick()
         self.assertEqual(control.wanted, Wanted(True, CancelMode.GRACEFUL), "a pause and a cancel never withdrawn")
 
+    def waiting(self, run_id, queued):
+        board = self.board(run_id)
+        board.status.phase, board.status.queued = Phase.WAITING, queued
+        board.publish()
+        return board
+
+    def test_a_run_moved_to_the_front_goes_before_everyone_who_waits_and_the_last_moved_first(self):
+        first = self.waiting("a" * 32, "2026-11-07T10:00:00.000005Z")
+        second = self.waiting("b" * 32, "2026-11-07T10:00:00.000009Z")
+        third = self.waiting("c" * 32, "2026-11-07T10:00:00.000012Z")
+        self.assertEqual(run_next(self.layout, third.status.run_id).queued, "2026-11-07T10:00:00.000004Z")
+        pump = StatusPump(third, RunControl(third.status))
+        pump.tick()
+        self.assertEqual(third.status.queued, "2026-11-07T10:00:00.000004Z", "it reaches its status as it reads it")
+        self.assertEqual(run_next(self.layout, second.status.run_id).queued, "2026-11-07T10:00:00.000003Z")
+        self.assertEqual(first.status.queued, "2026-11-07T10:00:00.000005Z", "the others keep their places")
+
+    def test_a_place_in_line_survives_the_requests_after_it(self):
+        board = self.waiting("a" * 32, "2026-11-07T10:00:00.000005Z")
+        moved = run_next(self.layout, board.status.run_id).queued
+        self.assertEqual(request(self.layout, board.status.run_id, cancel=CancelMode.GRACEFUL),
+                         Wanted(False, CancelMode.GRACEFUL, moved))
+        self.assertEqual(board.wanted().queued, moved)
+
+    def test_a_status_written_by_an_older_copy_counts_from_the_second_it_started(self):
+        board = self.waiting("a" * 32, "")
+        self.assertEqual(run_next(self.layout, board.status.run_id).queued, "2026-10-14T09:59:59.999999Z")
+
+    def test_a_pause_ends_at_once_where_no_board_is_given(self):
+        board = self.board()
+        control = RunControl(board.status)
+        control.update(Wanted(True))
+        self.assertTrue(control.pause_wanted())
+        board.status.paused = True
+        control.update(Wanted())
+        self.assertFalse(control.pause_wanted())
+        self.assertFalse(board.status.paused)
+
+    def test_a_pause_or_a_cancel_ends_the_asking_for_the_drives_back(self):
+        for wanted, paused in ((Wanted(True), True), (Wanted(False, CancelMode.GRACEFUL), False)):
+            board = StatusBoard(self.layout, status())
+            board.status.paused, board.status.resuming, board.status.waiting_for = True, True, {"run_id": "b" * 32}
+            control = RunControl(board.status, board)
+            control.update(wanted)
+            self.assertEqual(control.pause_wanted(), paused)
+            self.assertEqual((board.status.resuming, board.status.waiting_for), (False, None))
+
     def test_a_request_the_control_file_does_not_take_is_reported_and_one_it_takes_lands(self):
         board = self.board()
         request(self.layout, board.status.run_id, pause=True)
@@ -415,6 +462,48 @@ class StatusChannelTest(TempDirTest):
         self.assertEqual([r.outcome for r in reap_interrupted(self.layout)], [Outcome.INTERRUPTED])
         self.assertEqual(reap_interrupted(self.layout), [])
         self.assertEqual(len(read_records(self.layout, "j" * 32)), 1)
+
+    def dead(self, **fields):
+        """The status a dead run left: its file, with no lock held."""
+        self.layout.status_dir.mkdir(parents=True, exist_ok=True)
+        doc = dict(LiveStatus("d" * 32, 1, "j" * 32, "Job", "schedule", "2026-11-07T23:00:00Z").to_document(), **fields)
+        exchange.write_text(self.layout.status_dir / f"{'d' * 32}.json", json.dumps(doc))
+
+    def test_a_run_that_died_waiting_is_recorded_for_each_destination_it_was_to_serve(self):
+        self.dead(selected=[2, 3], markers=["1" * 32, "2" * 32, "3" * 32])
+        reaped = reap_interrupted(self.layout)
+        self.assertEqual([(r.marker_id, r.destination_index, r.outcome, r.reasons, r.trigger) for r in reaped],
+                         [("2" * 32, 2, Outcome.INTERRUPTED, (NEVER_BEGUN,), "schedule"),
+                          ("3" * 32, 3, Outcome.INTERRUPTED, (NEVER_BEGUN,), "schedule")])
+        self.assertIn("nothing was written", reaped[0].detail)
+        self.assertEqual(len(read_records(self.layout, "j" * 32)), 2)
+        self.assertEqual(list(self.layout.status_dir.iterdir()), [])
+
+    def test_a_run_that_died_waiting_with_none_selected_was_to_serve_every_destination(self):
+        self.dead(markers=["1" * 32, "2" * 32])
+        self.assertEqual([r.marker_id for r in reap_interrupted(self.layout)], ["1" * 32, "2" * 32])
+
+    def test_a_status_naming_no_destinations_leaves_no_record(self):
+        self.dead()
+        self.assertEqual(reap_interrupted(self.layout), [])
+        self.assertEqual(list(self.layout.status_dir.iterdir()), [])
+
+    def test_a_verification_that_died_leaves_no_run_record_whatever_it_names(self):
+        self.dead(kind="verification", markers=["1" * 32])
+        self.assertEqual(reap_interrupted(self.layout), [])
+
+    def test_a_record_says_when_the_user_had_paused_a_dead_run_or_asked_it_to_stop(self):
+        worked = dict(pair_index=1, marker_id="m" * 32, pair_started="2026-11-07T23:00:01Z")
+        for left in ({"paused": True}, {"cancelling": "graceful"}):
+            self.dead(**worked, **left)
+            (record,) = reap_interrupted(self.layout)
+            self.assertEqual(record.reasons, (PROCESS_ENDED, LEFT_BY_USER))
+            self.assertFalse(cut_short(record))
+        for still_wanted in ({}, {"paused": True, "resuming": True}):
+            self.dead(**worked, **still_wanted)
+            (record,) = reap_interrupted(self.layout)
+            self.assertEqual(record.reasons, (PROCESS_ENDED,))
+            self.assertTrue(cut_short(record))
 
 
 class StatusFoundByItsLockTest(TempDirTest):
@@ -540,6 +629,28 @@ class JobFileTest(TempDirTest):
         saved = result_of(self, saver)
         self.assertGreater((loads, saved["saves"]), (20, 20))
         self.assertEqual((len(failures), saved["failures"]), (0, 0), "\n".join(failures))   # each miss, unshortened
+
+
+class DeadBetweenDestinationsTest(TempDirTest):
+    """A run that died waiting for a turn between two of its destinations (the maintainer's
+    decision of 2026-11-10): those it finished keep their records, and each it had not reached
+    is recorded interrupted as having written nothing there, so a logon continues it."""
+
+    def setUp(self):
+        super().setUp()
+        self.layout = RuntimeLayout(self.tmp)
+
+    def test_each_destination_it_had_not_finished_is_recorded_as_never_reached(self):
+        self.layout.status_dir.mkdir(parents=True, exist_ok=True)
+        doc = dict(LiveStatus("d" * 32, 1, "j" * 32, "Job", "schedule", "2026-11-10T23:00:00Z").to_document(),
+                   selected=[1, 2, 3], markers=["1" * 32, "2" * 32, "3" * 32], finished=[[2, "completed"]])
+        exchange.write_text(self.layout.status_dir / f"{'d' * 32}.json", json.dumps(doc))
+        reaped = reap_interrupted(self.layout)
+        self.assertEqual([(r.destination_index, r.outcome, r.reasons) for r in reaped],
+                         [(1, Outcome.INTERRUPTED, (NEVER_BEGUN,)), (3, Outcome.INTERRUPTED, (NEVER_BEGUN,))])
+        self.assertIn("before the run reached this destination", reaped[0].detail)
+        self.assertTrue(all(cut_short(r) for r in reaped))
+        self.assertEqual(list(self.layout.status_dir.iterdir()), [])
 
 
 if __name__ == "__main__":

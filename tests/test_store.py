@@ -7,7 +7,8 @@ of jobs and groups and the moves within it; a save that changes only the GUI's
 remembered state or that order keeping no previous copy; the choices for activities
 among the preferences, each on in a file written before them; the schedule forms of
 schema 8, a schema-7 file's schedules kept as they were; a cloud drive's mark in schema 9,
-a schema-8 file kept as it was."""
+a schema-8 file kept as it was; each destination's switch in schema 10, a schema-9 job's
+switch carried onto its destinations."""
 import json
 import os
 import threading
@@ -771,6 +772,67 @@ class CloudMarkSchemaTest(TempDirTest):
         self.store.save(StoreContents((job("A", 1),), Preferences(activities=Activities(drive_kinds=marks))))
         before = self.path.read_bytes()
         older = ConfigStore(self.path, schema_version=8, migrations={k: v for k, v in MIGRATIONS.items() if k < 8})
+        self.assertIs(older.load().status, LoadStatus.UNSUPPORTED)
+        self.assertEqual(self.path.read_bytes(), before)
+
+
+class DestinationSwitchSchemaTest(TempDirTest):
+    """Schema 10: the job's switch became each destination's. In a schema-9 file or export
+    every destination of a job switched off reads switched off, of any other switched on;
+    a copy that knows only schema 9 leaves a schema-10 file untouched."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.tmp / "Config" / "mirrorhold.json"
+        self.store = ConfigStore(self.path)
+        two = [Endpoint(identity(201), "one"), Endpoint(identity(202), "two")]
+        self.on = new_job("On", Endpoint(identity(1), "src"), two)
+        self.off = new_job("Off", Endpoint(identity(2), "src"), two)
+
+    @staticmethod
+    def schema_9(job, enabled):
+        """``job``'s document as schema 9 wrote it: the switch on the job, none on a destination."""
+        doc = job.to_document()
+        for destination in doc["destinations"]:
+            del destination["switched_on"]
+        return {"enabled": enabled, **doc}
+
+    def switched(self, jobs):
+        return [[d.switched_on for d in j.destinations] for j in jobs]
+
+    def test_a_schema_9_file_carries_each_jobs_switch_onto_its_destinations(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"format": "mirrorhold-store", "schema_version": 9,
+                                         "jobs": [self.schema_9(self.on, True), self.schema_9(self.off, False)],
+                                         "groups": [], "preferences": Preferences().to_document()}),
+                             encoding="utf-8")
+        result = self.store.load()
+        self.assertIs(result.status, LoadStatus.MIGRATED)
+        self.assertEqual(self.switched(result.contents.jobs), [[True, True], [False, False]])
+        self.assertEqual([j.switched_on for j in result.contents.jobs], [(1, 2), ()])
+        self.store.save(result.contents)
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["schema_version"], SCHEMA_VERSION)
+        self.assertEqual([("enabled" in j, [d["switched_on"] for d in j["destinations"]]) for j in doc["jobs"]],
+                         [(False, [True, True]), (False, [False, False])])
+
+    def test_a_schema_9_export_carries_the_switch_the_same_way(self):
+        target = self.tmp / "export.json"
+        target.write_text(json.dumps({"format": "mirrorhold-jobs", "schema_version": 9,
+                                      "jobs": [self.schema_9(self.off, False)], "groups": []}), encoding="utf-8")
+        self.assertEqual(self.switched(self.store.read_export(target).jobs), [[False, False]])
+
+    def test_one_destination_switched_off_is_saved_and_read_back(self):
+        one_off = replace(self.on, destinations=(self.on.destinations[0],
+                                                 replace(self.on.destinations[1], switched_on=False)))
+        self.store.save(StoreContents((one_off,)))
+        self.assertEqual(self.store.load().contents.jobs, (one_off,))
+        self.assertEqual(self.store.load().contents.jobs[0].switched_on, (1,))
+
+    def test_a_copy_that_knows_only_schema_9_leaves_the_file_untouched(self):
+        self.store.save(StoreContents((self.on,)))
+        before = self.path.read_bytes()
+        older = ConfigStore(self.path, schema_version=9, migrations={k: v for k, v in MIGRATIONS.items() if k < 9})
         self.assertIs(older.load().status, LoadStatus.UNSUPPORTED)
         self.assertEqual(self.path.read_bytes(), before)
 

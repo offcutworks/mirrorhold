@@ -85,8 +85,8 @@ from mirrorhold.locations import VENDOR_DIR_NAME  # noqa: E402
 from mirrorhold_gui.shipped_model import ICON_FILE_NAME, LICENCE_FILE_NAME, NOTICES_FILE_NAME  # noqa: E402
 from release_core import (PYTHON_VERSION, SITE_PACKAGES, AfterZip, Assembly, BuildError,  # noqa: E402
                           BuildResult, Component, EMBEDDABLE, FULL_PYTHON, InputError, Suite, SuiteResult, Tool,
-                          check_label, checked, extract_member, failed_tests, label_time, python_licences, sha256_of,
-                          verdict)
+                          check_label, checked, extract_member, failed_tests, label_time, marked_flaky,
+                          python_licences, sha256_of, verdict)
 import release_core  # noqa: E402
 
 NAME = "MirrorHold"
@@ -120,6 +120,7 @@ NOTICES_INTRO = ("This release of MirrorHold carries the following software, eac
 CSC = Path(os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows",
            "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
 _LEDGER_ENTRY = re.compile(r"^### `([^`]+)`\s*$")
+_LEDGER_FIELD = re.compile(r"^- \*\*([a-z]+):\*\*(.*)$")
 _SUMMARY = re.compile(r"^(\d+) tests, (\d+) failed, (\d+) skipped$")
 
 
@@ -392,17 +393,61 @@ def make_setup(a: AfterZip, *, run: Runner = subprocess.run) -> List[Path]:
 # --- the suite -------------------------------------------------------------------------
 
 def ledger_tests(ledger: str) -> Set[str]:
-    """The tests ``TEST_LEDGER.md`` records as red: one entry heading per test."""
-    return {m.group(1) for line in ledger.splitlines() if (m := _LEDGER_ENTRY.match(line))}
+    """The tests ``TEST_LEDGER.md`` records as red: one entry heading per test, of every entry
+    whose delta does not carry the mark of a test red only sometimes."""
+    return _ledger(ledger)[0]
+
+
+def flaky_tests(ledger: str) -> Set[str]:
+    """The tests ``TEST_LEDGER.md`` records as red only sometimes: the heading of every entry whose
+    delta carries the core's ``FLAKY_MARK``."""
+    return _ledger(ledger)[1]
+
+
+def _ledger(ledger: str) -> Tuple[Set[str], Set[str]]:
+    red: Set[str] = set()
+    flaky: Set[str] = set()
+    for test, delta in _entries(ledger):
+        if test is not None:
+            (flaky if marked_flaky(delta) else red).add(test)
+    return red, flaky
+
+
+def _entries(ledger: str) -> List[Tuple[Optional[str], str]]:
+    """Each entry's test, from its ``### `` heading (None where the heading names none), and its
+    delta field, the field's lines indented by two spaces joined to it."""
+    entries: List[Tuple[Optional[str], str]] = []
+    test: Optional[str] = None
+    delta: Optional[str] = None             # None until the first heading: nothing before it is an entry
+    field: Optional[str] = None
+    for line in [*ledger.splitlines(), "### "]:
+        if line.startswith("### "):
+            if delta is not None:
+                entries.append((test, delta))
+            m = _LEDGER_ENTRY.match(line)
+            test, delta, field = (m.group(1) if m else None), "", None
+            continue
+        m = _LEDGER_FIELD.match(line)
+        if m:
+            field = m.group(1)
+            if field == "delta" and delta is not None:
+                delta = (delta + " " if delta else "") + m.group(2)
+        elif field == "delta" and delta is not None and line.startswith("  "):
+            delta += " " + line
+        elif not line.startswith("  "):
+            field = None
+    return entries
 
 
 def judge_suite(output: str, ledger: str) -> SuiteResult:
     """A ``run_all.py`` transcript against ``TEST_LEDGER.md``: its summary line, and the tests
-    unittest reports failed or in error, against those the ledger records."""
+    unittest reports failed or in error, against those the ledger records as red and as red only
+    sometimes."""
     summary = next((line.strip() for line in output.splitlines() if _SUMMARY.match(line.strip())), "")
     if not summary:
         raise BuildError("the suite ended without its summary line")
-    return verdict(summary, failed_tests(output), ledger_tests(ledger))
+    red, flaky = _ledger(ledger)
+    return verdict(summary, failed_tests(output), red, flaky=flaky)
 
 
 # --- the build -------------------------------------------------------------------------

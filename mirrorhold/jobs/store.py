@@ -71,7 +71,7 @@ from .model import Group, Job, Preferences, group_name_key
 
 STORE_FORMAT = "mirrorhold-store"
 EXPORT_FORMAT = "mirrorhold-jobs"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 Migration = Callable[[dict], dict]
 
@@ -166,9 +166,26 @@ def _add_cloud_mark(doc: dict) -> dict:
     return doc
 
 
+def _switch_per_destination(doc: dict) -> dict:
+    """Schema 9 to 10, for the store and an export alike: the job's switch (``enabled``)
+    became each destination's (``Destination.switched_on``); every destination of a job
+    switched off is switched off, of any other switched on. A value that is not true or
+    false is carried over to the strict decoding that follows."""
+    jobs = doc.get("jobs")
+    for job in jobs if isinstance(jobs, list) else ():
+        if not isinstance(job, dict) or "enabled" not in job:
+            continue
+        switch = job.pop("enabled")
+        destinations = job.get("destinations")
+        for destination in destinations if isinstance(destinations, list) else ():
+            if isinstance(destination, dict):
+                destination.setdefault("switched_on", switch)
+    return doc
+
+
 MIGRATIONS: Mapping[int, Migration] = {1: _add_groups, 2: _add_share_hold, 3: _add_activity_choices,
                                        4: _turns_by_drive_kind, 5: _add_drive_marks, 6: _add_remotes,
-                                       7: _add_schedule_forms, 8: _add_cloud_mark}
+                                       7: _add_schedule_forms, 8: _add_cloud_mark, 9: _switch_per_destination}
 """``MIGRATIONS[n]`` turns a version-n document into a version-(n+1) document."""
 
 PREVIOUS_DIR = "previous"

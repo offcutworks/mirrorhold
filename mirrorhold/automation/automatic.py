@@ -6,9 +6,17 @@ works out what arrived for this job (``arrival``) and runs only that, then looks
 and runs whatever arrived meanwhile — a second start of the task while it runs is
 ignored by Task Scheduler, so this loop is how a drive attached during a long run is
 still served. One arrival handler at a time per job holds the job's lock.
+``run_at_logon`` is a logon's, for a job that runs on a schedule alone: a run a shutdown or
+a crash cut short, whether it worked or waited for its turn, was started, so it is no
+occurrence Task Scheduler missed, and without this it would wait for the schedule's next
+occurrence, a month away for a monthly one. A logon runs what that occurrence would run,
+once, and only when the job's newest record of some destination says so
+(``records.record.cut_short``): nothing after an ordinary start of the computer, and nothing
+for a run the user had paused or was stopping.
 
-Both check the job first: a task left behind by an earlier configuration (the job
-removed, its automatic runs paused or switched off) runs nothing. Both raise each run's
+All three check the job first: a task left behind by an earlier configuration (the job
+removed, its automatic runs switched off, or every destination of it switched off) runs
+nothing, and a run never serves a destination switched off. All raise each run's
 notice, with the destinations it backed up whose full verification is due; a run that
 cannot start at all says why in a notice and in the job's ``automation/<job id>.log``
 beside the store. A notice that asks something of the user also leaves the job's reminder
@@ -29,12 +37,14 @@ from ..endpoints.cloud import SyncRoot
 from ..endpoints.volumes import VolumeSource
 from ..jobs.model import Job, Preferences
 from ..jobs.store import ConfigStore, LoadStatus, StoreError
-from ..locations import runtime_layout
+from ..locations import RuntimeLayout, runtime_layout
 from ..notifications import announce_run, failure_notice, show
 from ..notifications.toast import Notifier
 from ..records import diagnostics
+from ..records.admission import settle_interrupted
 from ..records.lock import FileLock, remove_quietly
-from ..records.record import RunRecord
+from ..records.record import RunRecord, cut_short, read_records
+from ..records.status import is_run, observe_runs
 from ..reminders import reminding
 from ..run.runner import JobRunResult, RunError, RunOptions, run_job
 from .arrival import (PresenceState, arrival_selection, arrivals, present_keys, read_state, settled_volumes,
@@ -68,13 +78,7 @@ def _job(store: ConfigStore, job_id: str, kind: str):
     preferences = loaded.contents.preferences
     if job is None:
         return None, preferences, "the job no longer exists"
-    if not job.enabled:
-        return job, preferences, "the job's automatic runs are paused"
-    if kind == ARRIVAL and not job.triggers.on_arrival:
-        return job, preferences, "the job no longer runs when its drives are attached"
-    if kind == SCHEDULE and job.triggers.schedule is None:
-        return job, preferences, "the job no longer runs on a schedule"
-    return job, preferences, ""
+    return job, preferences, job.not_automatic(kind)
 
 
 def _log_failure(store: ConfigStore, job_id: str, text: str) -> None:
@@ -132,6 +136,36 @@ def run_scheduled(store: ConfigStore, job_id: str, *, volume_source: VolumeSourc
         job, preferences, why_not = _job(store, job_id, SCHEDULE)
         if why_not:
             result.nothing_because = why_not
+            return result
+        _run(result, runner, store, job, preferences, RunOptions(unattended=True, automatic=SCHEDULE), notifier,
+             volume_source, sync_roots)
+        return result
+
+    return _guarded(store, job_id, notifier, body)
+
+
+def _cut_short(layout: RuntimeLayout, job: Job) -> bool:
+    """Whether a run of ``job`` was cut short and nothing has come since: no run of it is in
+    progress, and the newest record of one of its destinations says so."""
+    if any(r.alive and is_run(r.status) and r.status.get("job_id") == job.job_id for r in observe_runs(layout)):
+        return False
+    newest = {record.marker_id: record for record in read_records(layout, job.job_id)}
+    return any(cut_short(newest[d.marker_id]) for d in job.destinations if d.marker_id in newest)
+
+
+def run_at_logon(store: ConfigStore, job_id: str, *, volume_source: VolumeSource, sync_roots: Sequence[SyncRoot],
+                 notifier: Optional[Notifier] = None, runner: Runner = run_job) -> AutomaticResult:
+    layout = runtime_layout(store.path)
+
+    def body() -> AutomaticResult:
+        result = AutomaticResult()
+        job, preferences, why_not = _job(store, job_id, SCHEDULE)
+        if why_not:
+            result.nothing_because = why_not
+            return result
+        settle_interrupted(layout)
+        if not _cut_short(layout, job):
+            result.nothing_because = "no run of the job was cut short"
             return result
         _run(result, runner, store, job, preferences, RunOptions(unattended=True, automatic=SCHEDULE), notifier,
              volume_source, sync_roots)

@@ -18,7 +18,7 @@ Structure
     |-- __main__.py        `python -m mirrorhold` -> cli.run
     |-- cli.py             Command line: volumes, jobs, add, remove, validate,
     |                      resolve, export, import, engine; preview, run, verify,
-    |                      status, history, pause, resume, cancel; when, install,
+    |                      status, history, pause, resume, cancel, next; when, install,
     |                      uninstall, installation, reconcile, automatic.
     |-- locations.py       The one place runtime paths are decided, and which kind of
     |                      copy this code is (a working copy, the source installation's
@@ -118,7 +118,8 @@ time unless they conflict — over a folder one of them writes, or over a drive 
 that they take turns on: by the user's choice, automatically a drive that reports a seek
 penalty or does not say what it is (``endpoints.volumes.DriveKind``), unless the user
 says what it is (``jobs.model.DriveMark``) — and wait their
-turn otherwise (``records.admission``). While one works its process keeps
+turn otherwise (``records.admission``); a paused one frees its drives, and the user may move
+a waiting run to the front of the line. While one works its process keeps
 the computer from falling asleep by itself and has Windows' shutdown screen name it and
 offer to cancel the shutdown, unless the user chose otherwise (``power``).
 
@@ -137,8 +138,10 @@ A job runs only when it is started unless the user switches on its automatic run
 are Windows Task Scheduler tasks that the core alone registers, derived from the jobs
 whenever they change (``automation``); each starts the installed copy's core
 (``installation``) — the source installation's copy or a portable release set up where it
-lies — never a working copy, and nothing of the tool starts at sign-in or stays resident
-beyond the notification-area icon of a reminder the user has still to look at. How a copy
+lies — never a working copy, and nothing of the tool starts at sign-in but those tasks, for
+a job with automatic runs on, which look whether a drive arrived or a run was cut short and
+end, and nothing stays resident beyond the notification-area icon of a reminder the user
+has still to look at. How a copy
 starts itself again, for a run, a task, the Start menu entry or the notification-area icon,
 is decided in one place (``invocation``). Every run's process raises one notice when it ends
 (``notifications``), which also says when a destination it backed up is due a full

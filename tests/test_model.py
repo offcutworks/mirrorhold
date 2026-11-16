@@ -1,7 +1,7 @@
 """The job contract: vocabulary, defaults, strict documents, located errors.
 
-Binds the job contract — one source, one or more destinations, an enabled
-switch, triggers, hold thresholds (count floor 1000, 5 per cent), version cleanup
+Binds the job contract — one source, one or more destinations, each with its switch,
+triggers, hold thresholds (count floor 1000, 5 per cent), version cleanup
 (off, or keep N days), a verification reminder (90 days), snapshot reading and
 exclusions on the source; thresholds and cleanup per job — and a group of jobs: a name
 and its members' identifiers, in order; and the choices for activities among the
@@ -9,6 +9,7 @@ preferences."""
 import copy
 import json
 import unittest
+from dataclasses import replace
 
 from support import identity
 
@@ -24,10 +25,49 @@ def sample_job(**settings) -> Job:
                    [Endpoint(identity(2), "Backup\\Photos"), Endpoint(identity(3), "")], **settings)
 
 
+class DestinationSwitchTest(unittest.TestCase):
+    """Each destination's switch: on for a new one, kept through the document, strict, and
+    what a run that names no destination serves; a job with none on runs nothing by itself."""
+
+    def test_a_new_job_has_every_destination_switched_on(self):
+        job = sample_job()
+        self.assertEqual(([d.switched_on for d in job.destinations], job.switched_on), ([True, True], (1, 2)))
+        self.assertEqual(sample_job(triggers=Triggers(True, None)).not_automatic("arrival"), "")
+
+    def test_a_destination_switched_off_is_kept_through_the_document(self):
+        job = sample_job()
+        off = replace(job, destinations=(job.destinations[0], replace(job.destinations[1], switched_on=False)))
+        doc = json.loads(json.dumps(off.to_document()))
+        self.assertEqual([d["switched_on"] for d in doc["destinations"]], [True, False])
+        self.assertNotIn("enabled", doc)
+        again = Job.from_document(doc)
+        self.assertEqual((again, again.switched_on), (off, (1,)))
+
+    def test_every_destination_switched_off_stops_the_automatic_runs(self):
+        job = sample_job(triggers=Triggers(True, "daily 03:00"))
+        off = replace(job, destinations=tuple(replace(d, switched_on=False) for d in job.destinations))
+        self.assertEqual(off.switched_on, ())
+        for trigger in ("arrival", "schedule", None):
+            self.assertEqual(off.not_automatic(trigger), "every destination of the job is switched off")
+
+    def test_the_switch_is_required_and_strict_at_its_field(self):
+        missing = sample_job().to_document()
+        del missing["destinations"][1]["switched_on"]
+        with self.assertRaises(ContractError) as ctx:
+            Job.from_document(missing)
+        self.assertEqual(ctx.exception.where, "destinations[1]")
+        self.assertIn("missing switched_on", str(ctx.exception))
+        wrong = sample_job().to_document()
+        wrong["destinations"][1]["switched_on"] = "yes"
+        with self.assertRaises(ContractError) as ctx:
+            Job.from_document(wrong)
+        self.assertEqual(ctx.exception.where, "destinations[1].switched_on")
+
+
 class DefaultsTest(unittest.TestCase):
     def test_a_new_job_carries_the_contract_defaults(self):
         job = sample_job()
-        self.assertTrue(job.enabled)
+        self.assertEqual(([d.switched_on for d in job.destinations], job.switched_on), ([True, True], (1, 2)))
         self.assertEqual((job.holds.count_floor, job.holds.percent), (1000, 5))
         self.assertFalse(job.version_cleanup.enabled)
         self.assertEqual(job.verification_reminder_days, 90)
@@ -39,11 +79,10 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(len({job.job_id, *(d.marker_id for d in job.destinations)}), 3)
 
     def test_settings_are_passed_through(self):
-        job = sample_job(enabled=False, holds=HoldThresholds(50, 2.5), version_cleanup=VersionCleanup(30),
+        job = sample_job(holds=HoldThresholds(50, 2.5), version_cleanup=VersionCleanup(30),
                          verification_reminder_days=30, triggers=Triggers(True, "daily 03:00"),
                          read_from_snapshot=False, exclusions=("*.tmp", "Cache\\**"),
                          default_exclusions=DefaultExclusions(False, True))
-        self.assertFalse(job.enabled)
         self.assertEqual(job.holds.percent, 2.5)
         self.assertEqual(job.version_cleanup.keep_days, 30)
         self.assertEqual(job.triggers.schedule, "daily 03:00")
@@ -141,7 +180,7 @@ class DocumentTest(unittest.TestCase):
             (("holds", "count_floor"), True, "holds.count_floor"),
             (("version_cleanup", "keep_days"), 0, "version_cleanup.keep_days"),
             (("verification_reminder_days",), 0, "verification_reminder_days"),
-            (("enabled",), "yes", "enabled"),
+            (("destinations", 1, "switched_on"), "yes", "destinations[1].switched_on"),
             (("triggers", "schedule"), "  ", "triggers.schedule"),
             (("source", "endpoint", "path"), "a\\..\\b", "source.endpoint.path"),
             (("source", "endpoint", "volume", "anchor"), "C:", "source.endpoint.volume.anchor"),

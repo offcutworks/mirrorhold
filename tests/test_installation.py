@@ -492,8 +492,9 @@ class PortableReleaseTest(TempDirTest):
         session.save(StoreContents((replace(self.job, triggers=Triggers(False, "daily 21:00")),)))
         self.assertEqual((session.automation.state, session.automation.result.removed),
                          (AutomationState.APPLIED, (f"{self.job.job_id}-arrival",)))
-        self.assertEqual((list(self.scheduler.xml), self.working_dirs()),
-                         ([f"{self.job.job_id}-schedule"], {str(older)}))
+        # A job with a schedule and no arrival also has its logon task, which continues a run cut short.
+        self.assertEqual((sorted(self.scheduler.xml), self.working_dirs()),
+                         ([f"{self.job.job_id}-logon", f"{self.job.job_id}-schedule"], {str(older)}))
         self.assertFalse(session.installation().here)
 
     def test_removing_the_setup_keeps_the_release_the_store_and_its_records(self):
